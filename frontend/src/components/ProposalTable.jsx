@@ -22,7 +22,7 @@ function ConfidencePip({ value }) {
   )
 }
 
-function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, nested }) {
+function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, nested, proposals = [] }) {
   const [expanded, setExpanded] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
   const [manualYear, setManualYear] = useState("")
@@ -66,9 +66,9 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || "Search failed")
       if (!data.matched) {
-        setSearchError(payload.ai
+        setSearchError(data.message || (payload.ai
           ? "AI could not suggest a confident match. Try manual search or Use as-is."
-          : "No TMDB match found. Try a different title or add a year.")
+          : "No TMDB match found. Try a different title or add a year."))
         return
       }
       onChange(index, {
@@ -94,7 +94,14 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
     rematch({ manual_title: manualTitle.trim(), manual_year: manualYear.trim() })
   }
 
-  const askAi = () => rematch({ ai: true })
+  const askAi = () => rematch({
+    ai: true,
+    rejected_title: proposal.matched_title,
+    rejected_tmdb_id: proposal.tmdb_id,
+    siblings: proposals
+      .filter(p => p.folder === proposal.folder && p.filename !== proposal.filename)
+      .map(p => p.filename),
+  })
 
   const aiReady = aiSettings?.ai_enabled && aiSettings.ai_provider && (
     (aiSettings.ai_provider === "openai" && aiSettings.openai_api_key) ||
@@ -356,7 +363,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
                     onClick={askAi}
                     disabled={busy || !aiReady}
                     title={aiReady
-                      ? "Ask your configured AI to interpret this filename and folder"
+                      ? "Look this file up as a series again. AI is asked only if that search still returns the current match"
                       : "Turn on AI in Settings and add an API key"}
                   >
                     {busy ? "…" : "Ask AI"}
@@ -543,7 +550,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
 
   const grouped = groupRows(filtered)
   const attentionCount = proposals.filter(needsAttention).length
-  const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }
+  const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, proposals }
   const tabs = [
     ["attention", attentionCount ? `Needs attention (${attentionCount})` : "Needs attention"],
     ["all", "All"],

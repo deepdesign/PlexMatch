@@ -12,6 +12,7 @@ import json
 import shutil
 import requests
 import subprocess
+from collections import defaultdict
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -109,6 +110,11 @@ NOISE_PATTERN = re.compile(
 )
 
 YEAR_PATTERN = re.compile(r"\b(19[5-9]\d|20[0-3]\d)\b")
+# A span such as 1985-1999 is part of a title ("Russia 1985-1999: TraumaZone"),
+# not the release year. Dots may sit on either side in a scene filename.
+YEAR_RANGE_PATTERN = re.compile(
+    r"\b(19[5-9]\d|20[0-3]\d)\s*[-–—]\s*(19[5-9]\d|20[0-3]\d)\b"
+)
 
 # Episode markers, in priority order. SxxExx is most explicit; "N of M" and
 # "Part N" / "Episode N" are common in documentary rips (e.g. "2of7").
@@ -182,6 +188,19 @@ def clean_episode_title(text: str) -> str:
     return text
 
 
+def release_year_match(name: str):
+    """The first standalone year, skipping years that belong to a title range."""
+    ranges = list(YEAR_RANGE_PATTERN.finditer(name))
+
+    def in_range(match) -> bool:
+        return any(match.start() >= span.start() and match.end() <= span.end() for span in ranges)
+
+    for match in YEAR_PATTERN.finditer(name):
+        if not in_range(match):
+            return match
+    return None
+
+
 def parse_filename(raw: str) -> dict:
     """
     Extract title, year, season, episode from a raw filename/folder name.
@@ -221,8 +240,8 @@ def parse_filename(raw: str) -> dict:
     if marker_start is not None:
         name = name[:marker_start]
 
-    # Extract year
-    year_match = YEAR_PATTERN.search(name)
+    # Extract a release year. A span such as 1985-1999 stays in the title.
+    year_match = release_year_match(name)
     year = int(year_match.group(0)) if year_match else None
 
     # Remove everything from the year (or resolution/source markers) onward
@@ -381,7 +400,8 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
 
     candidates = []
 
-    # Always search both unless clearly TV (has S/E pattern)
+    # Episode-numbered files are a series. Do not let a movie with a similar
+    # year (Russian Roulette, 1985) outrank the show.
     if not is_tv:
         for r in tmdb_search_movie(title, year, api_key):
             candidates.append({"result": r, "type": "movie"})
@@ -389,10 +409,8 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
     for r in tmdb_search_tv(title, year, api_key):
         candidates.append({"result": r, "type": "tv"})
 
-    # If TV-patterned, also check movies (some releases use SxxExx loosely)
     if is_tv:
-        for r in tmdb_search_movie(title, year, api_key):
-            candidates.append({"result": r, "type": "movie"})
+        candidates = [c for c in candidates if c["type"] != "movie"]
 
     if not candidates:
         return {"matched": False, "confidence": 0}
@@ -625,14 +643,16 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
     year = parsed["year"]
     is_tv = parsed["is_tv"]
 
-    # Prefer the type the filename implies, but fall back to the other / untyped
-    type_order = (["series", "movie", None] if is_tv else ["movie", "series", None])
+    # A file with an episode number is a series. Do not fall back to a movie.
+    type_order = (["series"] if is_tv else ["movie", "series", None])
     data = None
     for mt in type_order:
         data = omdb_by_title(title, year, mt, api_key)
         if data:
             break
     if not data:
+        return None
+    if is_tv and (data.get("Type") or "").lower() != "series":
         return None
 
     cand_title = data.get("Title") or ""
@@ -801,10 +821,12 @@ def _call_anthropic_chat(api_key: str, model: str, user_prompt: str) -> str:
     return "".join(parts)
 
 
-def ai_infer_media(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict) -> dict | None:
+def ai_infer_media(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict,
+                   harder: bool = False, siblings: list | None = None) -> dict | None:
     """
     Ask the configured AI provider to infer canonical Plex metadata.
     Results are cached per file + parsed hints (no API key in cache key).
+    A harder retry skips that cache and is told the current match was rejected.
     """
     if not ai_cfg.get("enabled"):
         return None
@@ -815,7 +837,7 @@ def ai_infer_media(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict
     provider = ai_cfg["provider"]
     model = ai_cfg["ai_model"] or AI_DEFAULT_MODELS[provider]
     cache_key = _ai_cache_key(provider, model, f.get("rel_path", ""), f.get("filename", ""), parsed)
-    if cache_key in _ai_result_cache:
+    if not harder and cache_key in _ai_result_cache:
         return _ai_result_cache[cache_key]
 
     alts = (prior_match or {}).get("alternatives") or []
@@ -825,6 +847,18 @@ def ai_infer_media(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict
     ]
     prior_title = (prior_match or {}).get("matched_title")
     prior_conf = (prior_match or {}).get("confidence")
+    prior_id = (prior_match or {}).get("tmdb_id")
+    sibling_lines = [f"- {name}" for name in (siblings or []) if name]
+
+    reject = ""
+    if harder:
+        reject = f"""
+This match was rejected. Do not return it:
+  rejected_title: {prior_title}
+  rejected_tmdb_id: {prior_id}
+Other files in the same folder:
+{chr(10).join(sibling_lines) if sibling_lines else '  (none)'}
+If any filename contains an episode number, media_type must be "tv"."""
 
     user_prompt = f"""File context:
   relative_path: {f.get('rel_path', '')}
@@ -840,7 +874,7 @@ Prior TMDB attempt:
   matched_title: {prior_title}
   confidence: {prior_conf}
 TMDB alternatives:
-{chr(10).join(alt_lines) if alt_lines else '  (none)'}"""
+{chr(10).join(alt_lines) if alt_lines else '  (none)'}{reject}"""
 
     try:
         if provider == "openai":
@@ -849,15 +883,17 @@ TMDB alternatives:
             raw = _call_anthropic_chat(api_key, model, user_prompt)
         data = _extract_json_object(raw)
     except (json.JSONDecodeError, KeyError, RuntimeError, requests.RequestException):
-        result = None
-        _ai_result_cache[cache_key] = result
-        if len(_ai_result_cache) > _AI_CACHE_MAX:
-            _ai_result_cache.clear()
-        return result
+        if not harder:
+            _ai_result_cache[cache_key] = None
+            if len(_ai_result_cache) > _AI_CACHE_MAX:
+                _ai_result_cache.clear()
+        return None
 
     media_type = (data.get("media_type") or "movie").strip().lower()
-    if media_type not in ("movie", "tv"):
-        media_type = "tv" if parsed.get("is_tv") else "movie"
+    if parsed.get("is_tv"):
+        media_type = "tv"
+    elif media_type not in ("movie", "tv"):
+        media_type = "movie"
 
     year = data.get("year")
     if year is not None and not isinstance(year, int):
@@ -886,27 +922,40 @@ TMDB alternatives:
     if not result["canonical_title"]:
         result = None
 
-    _ai_result_cache[cache_key] = result
-    if len(_ai_result_cache) > _AI_CACHE_MAX:
-        _ai_result_cache.clear()
+    if not harder:
+        _ai_result_cache[cache_key] = result
+        if len(_ai_result_cache) > _AI_CACHE_MAX:
+            _ai_result_cache.clear()
     return result
 
 
+def _same_rejected(match: dict | None, prior: dict | None) -> bool:
+    """True when a new match is the title or TMDB id the user already rejected."""
+    if not match or not match.get("matched") or not prior:
+        return False
+    rejected_id = prior.get("tmdb_id")
+    if rejected_id and str(match.get("tmdb_id") or "") == str(rejected_id):
+        return True
+    rejected = (prior.get("matched_title") or "").strip().casefold()
+    title = (match.get("matched_title") or "").strip().casefold()
+    return bool(rejected) and title == rejected
+
+
 def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, ai_cfg: dict,
-                   force: bool = False) -> dict | None:
+                   force: bool = False, harder: bool = False, siblings: list | None = None) -> dict | None:
     """
     Use AI to recover weak matches. Optionally re-query TMDB with the AI title.
-    Returns a match dict or None.
+    Returns a match dict or None. A harder retry will not repeat the rejected match.
     """
     weak = force or not prior_match.get("matched") or prior_match.get("confidence", 0) < 0.5
     if not weak or not ai_cfg.get("enabled"):
         return None
 
-    inference = ai_infer_media(f, parsed, prior_match, ai_cfg)
+    inference = ai_infer_media(f, parsed, prior_match, ai_cfg, harder=harder, siblings=siblings)
     if not inference or inference["confidence"] < 0.55:
         return None
 
-    is_tv = inference["media_type"] == "tv"
+    is_tv = True if parsed.get("is_tv") else inference["media_type"] == "tv"
     search_parsed = {
         "title": inference["canonical_title"],
         "year": inference.get("year") or parsed.get("year"),
@@ -918,6 +967,8 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
     try:
         tmdb_match = find_best_match(search_parsed, tmdb_api_key)
         if tmdb_match.get("matched") and tmdb_match.get("confidence", 0) >= 0.4:
+            if harder and _same_rejected(tmdb_match, prior_match):
+                return None
             tmdb_match["source"] = "ai+tmdb"
             tmdb_match["ai_reason"] = inference.get("reason")
             if inference.get("episode_title") and not tmdb_match.get("episode_name"):
@@ -926,10 +977,10 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
     except Exception:
         pass
 
-    return {
+    fallback = {
         "matched": True,
         "confidence": inference["confidence"],
-        "type": inference["media_type"],
+        "type": "tv" if is_tv else inference["media_type"],
         "tmdb_id": None,
         "imdb_id": None,
         "matched_title": inference["canonical_title"],
@@ -940,6 +991,9 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
         "source": "ai",
         "ai_reason": inference.get("reason"),
     }
+    if harder and _same_rejected(fallback, prior_match):
+        return None
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1113,18 @@ def scan_directory(root: str) -> list:
                 "parse_hint": parse_hint,
                 "ext": Path(vf).suffix.lower(),
             })
+
+    by_folder = defaultdict(list)
+    for item in results:
+        by_folder[item["folder"]].append(item)
+    for items in by_folder.values():
+        episodic = any(
+            find_episode_marker(item["filename"]) or find_episode_marker(item["parse_hint"])
+            for item in items
+        )
+        if episodic:
+            for item in items:
+                item["group_tv"] = True
 
     return results
 
@@ -1340,6 +1406,8 @@ def build_proposal(f: dict, root: str, api_key: str,
     ai_cfg = ai_cfg or {"enabled": False}
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
+    if f.get("group_tv"):
+        parsed["is_tv"] = True
     if not parsed["title"]:
         if do_cleanup:
             cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids, restructure)
@@ -1820,27 +1888,65 @@ def rematch():
         if not _ai_api_key(ai_cfg):
             return jsonify({"error": "Choose OpenAI or Anthropic and paste an API key in Settings"}), 400
         ai_cfg["enabled"] = True
+        filename = data.get("filename", "")
+        siblings = [name for name in (data.get("siblings") or []) if isinstance(name, str) and name]
         f = {
             "full_path": data.get("full_path", ""),
             "rel_path": data.get("rel_path", ""),
-            "filename": data.get("filename", ""),
+            "filename": filename,
             "folder": data.get("folder", ""),
-            "parse_hint": Path(data.get("filename", "")).stem,
+            "parse_hint": Path(filename).stem,
             "ext": ext,
         }
-        file_parsed = parsed if parsed.get("title") else parse_filename(f["parse_hint"])
+        file_parsed = parse_filename(f["parse_hint"])
+        group_tv = file_parsed["is_tv"] or any(find_episode_marker(name) for name in siblings)
+        if group_tv:
+            file_parsed["is_tv"] = True
+        rejected_title = (data.get("rejected_title") or data.get("matched_title") or "").strip()
+        rejected_id = data.get("rejected_tmdb_id")
         prior_match = {
-            "matched": bool(data.get("matched_title")),
-            "matched_title": data.get("matched_title"),
+            "matched": bool(rejected_title),
+            "matched_title": rejected_title,
+            "tmdb_id": rejected_id,
             "confidence": data.get("confidence", 0),
             "alternatives": data.get("alternatives") or [],
         }
+
+        def usable(candidate):
+            return (
+                candidate
+                and candidate.get("matched")
+                and candidate.get("confidence", 0) >= 0.5
+                and not _same_rejected(candidate, prior_match)
+            )
+
         try:
-            match = apply_ai_match(f, file_parsed, prior_match, api_key, ai_cfg, force=True)
-        except RuntimeError as e:
+            fresh = find_best_match(file_parsed, api_key)
+        except Exception as e:
             return jsonify({"error": str(e)}), 502
-        if not match:
-            return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
+        omdb_key = (data.get("omdb_api_key") or "").strip()
+        if not usable(fresh) and omdb_key:
+            try:
+                omdb = omdb_lookup(file_parsed, omdb_key)
+            except Exception:
+                omdb = None
+            if usable(omdb):
+                fresh = omdb
+        if usable(fresh):
+            match = fresh
+        else:
+            try:
+                match = apply_ai_match(
+                    f, file_parsed, prior_match, api_key, ai_cfg,
+                    force=True, harder=True, siblings=siblings,
+                )
+            except RuntimeError as e:
+                return jsonify({"error": str(e)}), 502
+            if not match or _same_rejected(match, prior_match):
+                return jsonify({
+                    "matched": False,
+                    "message": "AI could not find a different match.",
+                })
         parsed = file_parsed
     elif not api_key:
         return jsonify({"error": "TMDB API key is required"}), 400
