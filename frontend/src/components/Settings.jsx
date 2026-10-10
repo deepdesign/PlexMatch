@@ -252,6 +252,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
   const outputSummary = [
     settings.restructure_folders ? "Plex folders" : "Rename in place",
     settings.split_libraries && settings.restructure_folders ? "Movies/TV split" : null,
+    settings.skip_output_folders !== false ? "Skip Movies/TV" : null,
     settings.embed_ids && settings.restructure_folders ? "IDs" : null,
   ].filter(Boolean).join(" · ")
 
@@ -402,6 +403,12 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             checked={settings.split_libraries}
             disabled={!settings.restructure_folders}
             onClick={() => update("split_libraries", !settings.split_libraries)}
+          />
+          <Toggle
+            label="Skip Movies and TV folders"
+            sub="Leave the Movies and TV folders this app already filled out of the next scan."
+            checked={settings.skip_output_folders !== false}
+            onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
           />
           <Toggle
             label="Add TMDB/IMDb IDs to folder names"

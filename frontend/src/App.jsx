@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS = {
   clean_unmatched: true,
   web_lookup: true,
   split_libraries: true,
+  skip_output_folders: true,
   embed_ids: true,
   omdb_api_key: "",
   ai_enabled: false,
@@ -34,6 +35,16 @@ const DEFAULT_SETTINGS = {
 
 // Statuses the user can approve and rename
 const APPROVABLE = new Set(["pending", "cleanup"])
+
+function inPlacePath(proposal, root) {
+  const sep = (root || "").includes("\\") ? "\\" : "/"
+  const folder = proposal.folder && proposal.folder !== "."
+    ? proposal.folder.replace(/[\\/]/g, sep)
+    : ""
+  const filename = proposal.proposed_filename || proposal.filename
+  const base = (root || "").replace(/[\\/]+$/, "")
+  return folder ? `${base}${sep}${folder}${sep}${filename}` : `${base}${sep}${filename}`
+}
 
 function pathInside(file, folder) {
   const norm = (p) => p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase()
@@ -217,7 +228,7 @@ export default function App() {
     setProposals([])
     setRenameResults([])
     setResultNote(null)
-    setScanProgress({ current: 0, total: 0 })
+    setScanProgress({ current: 0, total: 0, skipped: [] })
     setScanning(true)
     setStage(1)
 
@@ -235,6 +246,7 @@ export default function App() {
           clean_unmatched: settings.clean_unmatched,
           web_lookup: settings.web_lookup,
           split_libraries: settings.split_libraries,
+          skip_output_folders: settings.skip_output_folders !== false,
           embed_ids: settings.embed_ids,
           restructure_folders: settings.restructure_folders,
           auto_pick_top: settings.auto_pick_top,
@@ -273,7 +285,7 @@ export default function App() {
 
           if (msg.type === "start") {
             setScanRoot(msg.root)
-            setScanProgress({ current: 0, total: msg.total })
+            setScanProgress({ current: 0, total: msg.total, skipped: msg.skipped || [] })
           } else if (msg.type === "proposal") {
             received += 1
             const p = {
@@ -308,7 +320,9 @@ export default function App() {
       .filter(p => p.approved && APPROVABLE.has(p.status))
       .map(p => ({
         full_path: p.full_path,
-        proposed_full_path: p.proposed_full_path,
+        proposed_full_path: settings?.restructure_folders
+          ? p.proposed_full_path
+          : inPlacePath(p, scanRoot),
       }))
 
     if (!approved.length) return
@@ -464,6 +478,7 @@ export default function App() {
                   <p>Matching against TMDB...</p>
                   <p className="scan-sub">
                     {scanProgress.current} of {scanProgress.total} files processed
+                    {scanProgress.skipped?.length > 0 && ` · ${scanProgress.skipped.join(" and ")} not scanned`}
                   </p>
                 </>
               ) : (
@@ -589,8 +604,14 @@ export default function App() {
                 <span><strong className="text-amber">{conflictCount}</strong> conflicts</span>
               </>
             )}
+            {scanProgress.skipped?.length > 0 && (
+              <>
+                <span className="stat-dot" />
+                <span>{scanProgress.skipped.join(" and ")} not scanned</span>
+              </>
+            )}
             <span className="stat-dot" />
-            <span><strong>{approvedCount}</strong> approved for rename</span>
+            <span><strong>{approvedCount}</strong> included in rename</span>
           </div>
           <div className="footer-actions">
             <button className="btn-secondary" onClick={() => setStage(0)}>
@@ -601,7 +622,9 @@ export default function App() {
               onClick={handleRename}
               disabled={renaming || approvedCount === 0}
             >
-              {renaming ? "Renaming..." : `Rename ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
+              {renaming
+                ? "Renaming..."
+                : `${settings?.restructure_folders ? "Rename and move" : "Rename"} ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
             </button>
           </div>
         </footer>

@@ -968,8 +968,7 @@ button.settings-warn:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 10px 16px 0;
   gap: 12px;
   flex-shrink: 0;
 }
@@ -1024,6 +1023,15 @@ button.settings-warn:hover {
 .filter-tab:last-child { border-right: none; }
 .filter-tab:hover { background: var(--surface-2); color: var(--text); }
 .filter-tab.active { background: var(--amber-dim); color: var(--amber); }
+
+.review-hint {
+  margin: 0;
+  padding: 8px 16px 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
 
 .season-row td {
   background: var(--surface-2);
@@ -1125,8 +1133,6 @@ button.settings-warn:hover {
 .proposal-row:hover { background: var(--surface-2); }
 
 .row-approved { }
-.row-rejected td { opacity: 0.4; }
-.row-rejected td:first-child { opacity: 1; }
 .row-unmatched td { opacity: 0.5; }
 .row-unmatched td:first-child { opacity: 1; }
 
@@ -1200,10 +1206,11 @@ button.settings-warn:hover {
   color: var(--green);
 }
 
-.approve-btn.rejected {
-  border-color: var(--red);
-  background: var(--red-dim);
-  color: var(--red);
+.approve-btn.rejected,
+.approve-btn.waiting {
+  border-color: var(--border-2);
+  background: none;
+  color: var(--text-3);
 }
 
 .approve-btn:hover { transform: scale(1.1); }

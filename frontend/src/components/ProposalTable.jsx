@@ -29,6 +29,8 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   const [busy, setBusy] = useState(false)
   const [searchError, setSearchError] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const stayFolder = proposal.folder && proposal.folder !== "." ? proposal.folder : ""
+  const shownFolder = restructure ? proposal.proposed_folder : stayFolder
 
   const toggle = () => {
     onChange(index, { ...proposal, approved: !proposal.approved })
@@ -174,7 +176,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
 
   return (
     <>
-      <tr className={`proposal-row ${nested ? "row-episode" : ""} ${isOrganised ? "row-organised" : isConflict ? "row-conflict" : proposal.approved ? "row-approved" : "row-rejected"} ${isUnmatched ? "row-unmatched" : ""}`}>
+      <tr className={`proposal-row ${nested ? "row-episode" : ""} ${isOrganised ? "row-organised" : isConflict ? "row-conflict" : proposal.approved ? "row-approved" : ""} ${isUnmatched ? "row-unmatched" : ""}`}>
         <td className="col-approve">
           {isOrganised && (
             <span className="organised-icon" title="Already in Plex format - no rename needed">
@@ -186,14 +188,15 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           )}
           {!isOrganised && !isConflict && !isUnmatched && !isError && (
             <button
-              className={`approve-btn ${proposal.approved ? "approved" : "rejected"}`}
+              className={`approve-btn ${proposal.approved ? "approved" : "waiting"}`}
               onClick={toggle}
-              title={proposal.approved ? "Click to reject" : "Click to approve"}
+              title={proposal.approved
+                ? "Included in the rename. Click to leave this file as it is."
+                : "Not included. Click to include this file when you click Rename."}
             >
-              {proposal.approved
-                ? <svg viewBox="0 0 14 14" fill="none"><path d="M2 7l4 4 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
-                : <svg viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
-              }
+              {proposal.approved && (
+                <svg viewBox="0 0 14 14" fill="none"><path d="M2 7l4 4 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              )}
             </button>
           )}
           {!isOrganised && !isConflict && (isUnmatched || isError) && (
@@ -221,15 +224,17 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
               )}
               {isCleanup && (
                 <span className="cleanup-label">
-                  {isWeb ? "Matched via Wikipedia - no TMDB result" : "Cleaned from filename - no TMDB match"}
+                  {isWeb
+                    ? "Suggestion from Wikipedia. Nothing is renamed until you include it."
+                    : "Suggested tidy name. No TMDB match. Nothing is renamed until you include it."}
                 </span>
               )}
               {proposal.missing_year && (
                 <span className="missing-year-label" title="Plex matches best with a year. Expand to add one.">
-                  No year - add one for better Plex matching
+                  No year yet. Expand the row to add one.
                 </span>
               )}
-              <span className="proposed-folder">{proposal.proposed_folder}/</span>
+              {shownFolder && <span className="proposed-folder">{shownFolder}/</span>}
               <span className="proposed-file">{proposal.proposed_filename}</span>
             </div>
           )}
@@ -447,15 +452,17 @@ function SeasonGroup({ group, rowProps, onSetApproved }) {
             </span>
           ) : (
             <button
-              className={`approve-btn ${allOn ? "approved" : mixed ? "mixed" : "rejected"}`}
+              className={`approve-btn ${allOn ? "approved" : mixed ? "mixed" : "waiting"}`}
               onClick={toggle}
-              title={allOn ? "Reject every episode in this season" : "Approve every episode in this season"}
+              title={allOn
+                ? "Every episode is included. Click to leave this season as it is."
+                : "Include every episode in this season in the rename."}
             >
               {allOn
                 ? <svg viewBox="0 0 14 14" fill="none"><path d="M2 7l4 4 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
                 : mixed
                   ? <svg viewBox="0 0 14 14" fill="none"><path d="M3 7h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
-                  : <svg viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                  : null
               }
             </button>
           )}
@@ -508,6 +515,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
   const filtered = useMemo(() => {
     return proposals.filter(p => {
       if (!showOrganised && p.status === "organised") return false
+      if (filter === "rename" && !(p.approved && APPROVABLE_ROW.has(p.status))) return false
       if (filter === "attention" && !needsAttention(p)) return false
       if (filter === "matched" && (!p.matched || p.status === "unmatched")) return false
       if (filter === "unmatched" && p.matched && p.status !== "unmatched") return false
@@ -550,13 +558,21 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
 
   const grouped = groupRows(filtered)
   const attentionCount = proposals.filter(needsAttention).length
+  const includedCount = proposals.filter(p => p.approved && APPROVABLE_ROW.has(p.status)).length
   const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, proposals }
   const tabs = [
-    ["attention", attentionCount ? `Needs attention (${attentionCount})` : "Needs attention"],
     ["all", "All"],
+    ["rename", `Rename (${includedCount})`],
     ["matched", "Matched"],
-    ["unmatched", "Unmatched"],
+    ["attention", attentionCount ? `Needs attention (${attentionCount})` : "Needs attention"],
   ]
+  const hint = filter === "attention"
+    ? "Missing year, name clash, or weak match."
+    : filter === "rename"
+    ? "These files will be renamed."
+    : filter === "matched"
+    ? "Matched a title. Check to include."
+    : "Only checked files are renamed."
 
   return (
     <div className="proposal-panel">
@@ -591,10 +607,11 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
           )}
         </div>
         <div className="toolbar-right">
-          <button className="btn-ghost" onClick={approveAll}>Approve all</button>
-          <button className="btn-ghost" onClick={rejectAll}>Reject all</button>
+          <button className="btn-ghost" onClick={approveAll} title="Include every suggested rename, including filename tidy-ups">Include all</button>
+          <button className="btn-ghost" onClick={rejectAll} title="Leave every file as it is">Include none</button>
         </div>
       </div>
+      <p className="review-hint">{hint}</p>
 
       <div className="table-scroll">
         <table className="proposal-table">
@@ -632,7 +649,9 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
 
         {filtered.length === 0 && (
           <div className="table-empty">
-            {!showOrganised && organisedCount > 0 && proposals.length === organisedCount
+            {filter === "rename"
+              ? "Nothing is included yet. Open Needs attention and check the files you want Rename to move."
+              : !showOrganised && organisedCount > 0 && proposals.length === organisedCount
               ? `All ${organisedCount} files are already organised - nothing to rename.`
               : "No files match the current filter."}
           </div>

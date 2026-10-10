@@ -58,6 +58,7 @@ def load_settings():
         "clean_unmatched": True,
         "web_lookup": True,
         "split_libraries": True,
+        "skip_output_folders": True,
         "embed_ids": True,
         "omdb_api_key": "",
         "ai_enabled": False,
@@ -1064,14 +1065,35 @@ def apply_layout(plex_names: dict, current_folder: str | None, restructure: bool
 # File scanning
 # ---------------------------------------------------------------------------
 
-def scan_directory(root: str) -> list:
+# Folders the app creates at the library root when films and series are split.
+OUTPUT_DIR_NAMES = {MOVIES_DIR.lower(), TV_DIR.lower()}
+SKIP_DIR_NAMES = {
+    "subs", "subtitles", "extras", "featurettes", "behind the scenes", "sample", "samples",
+}
+
+
+def present_output_dirs(root: str) -> list:
+    """Movies and TV folders that already exist directly under the library."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    found = []
+    for canonical in (MOVIES_DIR, TV_DIR):
+        if any(name.lower() == canonical.lower() and os.path.isdir(os.path.join(root, name)) for name in names):
+            found.append(canonical)
+    return found
+
+
+def scan_directory(root: str, skip_output: bool = False) -> list:
     """
     Walk root recursively. For each video file found, return its path and
     the best display name to parse (prefers parent folder name for single-file
     folders, falls back to filename).
+    When skip_output is set, Movies and TV directly under the library are not walked.
     """
     results = []
-    root_path = Path(root)
+    root_norm = os.path.normcase(os.path.normpath(root))
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Filter to video files only
@@ -1080,11 +1102,12 @@ def scan_directory(root: str) -> list:
             if Path(f).suffix.lower() in VIDEO_EXTENSIONS
         ]
 
-        # Skip subtitle/extras/sample folders
-        dirnames[:] = [
-            d for d in dirnames
-            if d.lower() not in {"subs", "subtitles", "extras", "featurettes", "behind the scenes", "sample", "samples"}
-        ]
+        blocked = set(SKIP_DIR_NAMES)
+        at_root = os.path.normcase(os.path.normpath(dirpath)) == root_norm
+        if skip_output and at_root:
+            blocked |= OUTPUT_DIR_NAMES
+        # Skip subtitle/extras/sample folders, and the app's own Movies/TV output when asked
+        dirnames[:] = [d for d in dirnames if d.lower() not in blocked]
 
         # Drop obvious sample clips (e.g. "...-sample.avi", "movie.sample.mkv")
         video_files = [f for f in video_files if not SAMPLE_PATTERN.search(Path(f).stem)]
@@ -1751,7 +1774,8 @@ def scan():
     auto_pick = bool(data.get("auto_pick_top", True))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
-    files = scan_directory(root)
+    skip_output = bool(data.get("skip_output_folders", False))
+    files = scan_directory(root, skip_output=skip_output)
     with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
         # executor.map preserves input order
         proposals = list(executor.map(
@@ -1791,13 +1815,15 @@ def scan_stream():
     auto_pick = bool(data.get("auto_pick_top", True))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
-    files = scan_directory(root)
+    skip_output = bool(data.get("skip_output_folders", False))
+    skipped = present_output_dirs(root) if skip_output else []
+    files = scan_directory(root, skip_output=skip_output)
 
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
     def generate():
-        yield sse({"type": "start", "total": len(files), "root": root})
+        yield sse({"type": "start", "total": len(files), "root": root, "skipped": skipped})
         # Match files concurrently. Cancel anything not yet started if the
         # client stops the scan; a file already in flight finishes.
         executor = ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY)
