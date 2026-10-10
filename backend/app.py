@@ -59,6 +59,12 @@ def load_settings():
         "split_libraries": True,
         "embed_ids": True,
         "omdb_api_key": "",
+        "ai_enabled": False,
+        "ai_provider": "",
+        "openai_api_key": "",
+        "anthropic_api_key": "",
+        "ai_model": "",
+        "openai_base_url": "",
     }
 
 def save_settings(data):
@@ -629,6 +635,276 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# AI fallback (OpenAI or Anthropic) - user-supplied API keys, local only
+# ---------------------------------------------------------------------------
+
+AI_DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-3-5-haiku-20241022",
+}
+
+AI_CONSOLE_URLS = {
+    "openai": "https://platform.openai.com/api-keys",
+    "anthropic": "https://console.anthropic.com/settings/keys",
+}
+
+AI_SYSTEM_PROMPT = """You help organize documentary video files for Plex media servers.
+Given folder context, filename, and parsed hints, respond with ONLY a JSON object (no markdown).
+Required keys:
+  canonical_title (string),
+  year (integer or null),
+  media_type ("movie" or "tv"),
+  season (integer or null),
+  episode (integer or null),
+  episode_title (string or null),
+  confidence (number 0-1),
+  reason (one short sentence explaining your choice).
+Rules:
+- Multi-part series (SxxExx, NofM, Part N) are usually media_type "tv".
+- Standalone feature documentaries are usually "movie".
+- Strip release groups, codecs, resolution, [bracket tags], and scene country tags (UK/US) unless part of the official title.
+- Prefer well-known English broadcast titles (BBC, PBS, etc.)."""
+
+
+_ai_result_cache: dict[str, dict | None] = {}
+_AI_CACHE_MAX = 512
+
+
+def _ai_cache_key(provider: str, model: str, rel_path: str, filename: str, parsed: dict) -> str:
+    payload = {
+        "provider": provider,
+        "model": model,
+        "rel_path": rel_path,
+        "filename": filename,
+        "parsed": {k: parsed.get(k) for k in ("title", "year", "season", "episode", "is_tv")},
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def parse_ai_settings(data: dict) -> dict:
+    """Extract AI options from a scan/rematch request body."""
+    provider = (data.get("ai_provider") or "").strip().lower()
+    if provider not in ("openai", "anthropic"):
+        provider = ""
+    return {
+        "enabled": bool(data.get("ai_enabled")) and bool(provider),
+        "provider": provider,
+        "openai_api_key": (data.get("openai_api_key") or "").strip(),
+        "anthropic_api_key": (data.get("anthropic_api_key") or "").strip(),
+        "ai_model": (data.get("ai_model") or "").strip(),
+        "openai_base_url": (data.get("openai_base_url") or "").strip().rstrip("/"),
+    }
+
+
+def _ai_api_key(ai_cfg: dict) -> str | None:
+    if ai_cfg["provider"] == "openai":
+        return ai_cfg["openai_api_key"] or None
+    if ai_cfg["provider"] == "anthropic":
+        return ai_cfg["anthropic_api_key"] or None
+    return None
+
+
+def _extract_json_object(text: str) -> dict:
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start : end + 1]
+    return json.loads(text)
+
+
+def _call_openai_chat(api_key: str, model: str, user_prompt: str, base_url: str) -> str:
+    root = base_url or "https://api.openai.com/v1"
+    url = f"{root}/chat/completions"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI API error ({r.status_code}): {r.text[:200]}")
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _call_anthropic_chat(api_key: str, model: str, user_prompt: str) -> str:
+    url = "https://api.anthropic.com/v1/messages"
+    body = {
+        "model": model,
+        "max_tokens": 1024,
+        "system": AI_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    r = requests.post(
+        url,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Anthropic API error ({r.status_code}): {r.text[:200]}")
+    blocks = r.json().get("content") or []
+    parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+    return "".join(parts)
+
+
+def ai_infer_documentary(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict) -> dict | None:
+    """
+    Ask the configured AI provider to infer canonical Plex metadata.
+    Results are cached per file + parsed hints (no API key in cache key).
+    """
+    if not ai_cfg.get("enabled"):
+        return None
+    api_key = _ai_api_key(ai_cfg)
+    if not api_key:
+        return None
+
+    provider = ai_cfg["provider"]
+    model = ai_cfg["ai_model"] or AI_DEFAULT_MODELS[provider]
+    cache_key = _ai_cache_key(provider, model, f.get("rel_path", ""), f.get("filename", ""), parsed)
+    if cache_key in _ai_result_cache:
+        return _ai_result_cache[cache_key]
+
+    alts = (prior_match or {}).get("alternatives") or []
+    alt_lines = [
+        f"- {a.get('title')} ({a.get('year')}) [{a.get('type')}] score={a.get('confidence')}"
+        for a in alts[:3]
+    ]
+    prior_title = (prior_match or {}).get("matched_title")
+    prior_conf = (prior_match or {}).get("confidence")
+
+    user_prompt = f"""File context:
+  relative_path: {f.get('rel_path', '')}
+  folder: {f.get('folder', '')}
+  filename: {f.get('filename', '')}
+Parsed hints:
+  title: {parsed.get('title')}
+  year: {parsed.get('year')}
+  season: {parsed.get('season')}
+  episode: {parsed.get('episode')}
+  is_tv: {parsed.get('is_tv')}
+Prior TMDB attempt:
+  matched_title: {prior_title}
+  confidence: {prior_conf}
+TMDB alternatives:
+{chr(10).join(alt_lines) if alt_lines else '  (none)'}"""
+
+    try:
+        if provider == "openai":
+            raw = _call_openai_chat(api_key, model, user_prompt, ai_cfg["openai_base_url"])
+        else:
+            raw = _call_anthropic_chat(api_key, model, user_prompt)
+        data = _extract_json_object(raw)
+    except (json.JSONDecodeError, KeyError, RuntimeError, requests.RequestException):
+        result = None
+        _ai_result_cache[cache_key] = result
+        if len(_ai_result_cache) > _AI_CACHE_MAX:
+            _ai_result_cache.clear()
+        return result
+
+    media_type = (data.get("media_type") or "movie").strip().lower()
+    if media_type not in ("movie", "tv"):
+        media_type = "tv" if parsed.get("is_tv") else "movie"
+
+    year = data.get("year")
+    if year is not None and not isinstance(year, int):
+        try:
+            year = int(str(year)[:4])
+        except (TypeError, ValueError):
+            year = parsed.get("year")
+
+    confidence = data.get("confidence", 0.5)
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
+    result = {
+        "canonical_title": (data.get("canonical_title") or parsed.get("title") or "").strip(),
+        "year": year,
+        "media_type": media_type,
+        "season": data.get("season") if data.get("season") is not None else parsed.get("season"),
+        "episode": data.get("episode") if data.get("episode") is not None else parsed.get("episode"),
+        "episode_title": (data.get("episode_title") or "").strip() or None,
+        "confidence": round(confidence, 3),
+        "reason": (data.get("reason") or "").strip(),
+    }
+    if not result["canonical_title"]:
+        result = None
+
+    _ai_result_cache[cache_key] = result
+    if len(_ai_result_cache) > _AI_CACHE_MAX:
+        _ai_result_cache.clear()
+    return result
+
+
+def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, ai_cfg: dict,
+                   force: bool = False) -> dict | None:
+    """
+    Use AI to recover weak matches. Optionally re-query TMDB with the AI title.
+    Returns a match dict or None.
+    """
+    weak = force or not prior_match.get("matched") or prior_match.get("confidence", 0) < 0.5
+    if not weak or not ai_cfg.get("enabled"):
+        return None
+
+    inference = ai_infer_documentary(f, parsed, prior_match, ai_cfg)
+    if not inference or inference["confidence"] < 0.55:
+        return None
+
+    is_tv = inference["media_type"] == "tv"
+    search_parsed = {
+        "title": inference["canonical_title"],
+        "year": inference.get("year") or parsed.get("year"),
+        "season": inference.get("season") or parsed.get("season"),
+        "episode": inference.get("episode") or parsed.get("episode"),
+        "is_tv": is_tv,
+    }
+
+    try:
+        tmdb_match = find_best_match(search_parsed, tmdb_api_key)
+        if tmdb_match.get("matched") and tmdb_match.get("confidence", 0) >= 0.4:
+            tmdb_match["source"] = "ai+tmdb"
+            tmdb_match["ai_reason"] = inference.get("reason")
+            if inference.get("episode_title") and not tmdb_match.get("episode_name"):
+                tmdb_match["episode_name"] = inference["episode_title"]
+            return tmdb_match
+    except Exception:
+        pass
+
+    return {
+        "matched": True,
+        "confidence": inference["confidence"],
+        "type": inference["media_type"],
+        "tmdb_id": None,
+        "imdb_id": None,
+        "matched_title": inference["canonical_title"],
+        "matched_year": str(inference["year"]) if inference.get("year") else "",
+        "episode_name": inference.get("episode_title"),
+        "season": search_parsed.get("season"),
+        "episode": search_parsed.get("episode"),
+        "source": "ai",
+        "ai_reason": inference.get("reason"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Plex naming
 # ---------------------------------------------------------------------------
 
@@ -873,8 +1149,9 @@ def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
 def build_proposal(f: dict, root: str, api_key: str,
                    clean_unmatched: bool = False, web_lookup: bool = False,
                    split: bool = False, embed_ids: bool = False,
-                   omdb_key: str = "") -> dict:
-    """Match a single scanned file against TMDB (then OMDb) and build a proposal."""
+                   omdb_key: str = "", ai_cfg: dict | None = None) -> dict:
+    """Match a single scanned file against TMDB, OMDb, AI, then local cleanup."""
+    ai_cfg = ai_cfg or {"enabled": False}
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
     if not parsed["title"]:
@@ -911,6 +1188,14 @@ def build_proposal(f: dict, root: str, api_key: str,
             omdb = None
         if omdb and omdb["confidence"] >= 0.5:
             match = omdb
+
+    if (not match["matched"] or match["confidence"] < 0.5) and ai_cfg.get("enabled"):
+        try:
+            ai_match = apply_ai_match(f, parsed, match, api_key, ai_cfg)
+        except Exception:
+            ai_match = None
+        if ai_match:
+            match = ai_match
 
     if not match["matched"] or match["confidence"] < 0.3:
         if do_cleanup:
@@ -1046,6 +1331,12 @@ def find_orphan_folders(root: str) -> list:
 # API routes
 # ---------------------------------------------------------------------------
 
+@app.route("/api/ai/console-urls", methods=["GET"])
+def ai_console_urls():
+    """Browser URLs where users sign in and create API keys (no OAuth in-app)."""
+    return jsonify(AI_CONSOLE_URLS)
+
+
 @app.route("/api/scan", methods=["POST"])
 def scan():
     """Blocking scan: returns all proposals at once (legacy/fallback)."""
@@ -1063,11 +1354,14 @@ def scan():
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
     omdb_key = data.get("omdb_api_key", "").strip()
+    ai_cfg = parse_ai_settings(data)
     files = scan_directory(root)
     with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
         # executor.map preserves input order
         proposals = list(executor.map(
-            lambda f: build_proposal(f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key),
+            lambda f: build_proposal(
+                f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key, ai_cfg
+            ),
             files,
         ))
     return jsonify({"proposals": proposals, "root": root})
@@ -1098,6 +1392,7 @@ def scan_stream():
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
     omdb_key = data.get("omdb_api_key", "").strip()
+    ai_cfg = parse_ai_settings(data)
     files = scan_directory(root)
 
     def sse(obj: dict) -> str:
@@ -1109,7 +1404,10 @@ def scan_stream():
         # each proposal as soon as it's ready.
         with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
             futures = {
-                executor.submit(build_proposal, f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key): i
+                executor.submit(
+                    build_proposal, f, root, api_key, clean_unmatched, web_lookup,
+                    split, embed_ids, omdb_key, ai_cfg,
+                ): i
                 for i, f in enumerate(files)
             }
             for future in as_completed(futures):
@@ -1174,10 +1472,40 @@ def rematch():
             return jsonify({"error": "Could not build a name from this file"}), 400
         return jsonify(cleanup)
 
-    if not api_key:
-        return jsonify({"error": "TMDB API key is required"}), 400
+    ai_cfg = parse_ai_settings(data)
+    match = None
 
-    if tmdb_id and media_type:
+    if data.get("ai"):
+        if not api_key:
+            return jsonify({"error": "TMDB API key is required"}), 400
+        if not _ai_api_key(ai_cfg):
+            return jsonify({"error": "Choose OpenAI or Anthropic and paste an API key in Settings"}), 400
+        ai_cfg["enabled"] = True
+        f = {
+            "full_path": data.get("full_path", ""),
+            "rel_path": data.get("rel_path", ""),
+            "filename": data.get("filename", ""),
+            "folder": data.get("folder", ""),
+            "parse_hint": Path(data.get("filename", "")).stem,
+            "ext": ext,
+        }
+        file_parsed = parsed if parsed.get("title") else parse_filename(f["parse_hint"])
+        prior_match = {
+            "matched": bool(data.get("matched_title")),
+            "matched_title": data.get("matched_title"),
+            "confidence": data.get("confidence", 0),
+            "alternatives": data.get("alternatives") or [],
+        }
+        try:
+            match = apply_ai_match(f, file_parsed, prior_match, api_key, ai_cfg, force=True)
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 502
+        if not match:
+            return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
+        parsed = file_parsed
+    elif not api_key:
+        return jsonify({"error": "TMDB API key is required"}), 400
+    elif tmdb_id and media_type:
         details = tmdb_get_details(media_type, tmdb_id, api_key)
         if not details:
             return jsonify({"error": "Could not load that TMDB title"}), 502
@@ -1211,9 +1539,9 @@ def rematch():
                 match = omdb
         parsed = search_parsed
     else:
-        return jsonify({"error": "Provide either a TMDB id or a manual title"}), 400
+        return jsonify({"error": "Provide a TMDB id, manual title, or AI request"}), 400
 
-    if not match.get("matched"):
+    if not match or not match.get("matched"):
         return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
 
     plex_names = build_plex_names(match, ext, split, embed_ids)

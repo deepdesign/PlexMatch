@@ -22,7 +22,7 @@ function ConfidencePip({ value }) {
   )
 }
 
-function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds }) {
+function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, aiSettings }) {
   const [expanded, setExpanded] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
   const [manualYear, setManualYear] = useState("")
@@ -55,13 +55,19 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           split_libraries: split,
           embed_ids: embedIds,
           omdb_api_key: omdbKey,
+          ...aiSettings,
+          matched_title: proposal.matched_title,
+          confidence: proposal.confidence,
+          alternatives: proposal.alternatives,
           ...payload,
         }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || "Search failed")
       if (!data.matched) {
-        setSearchError("No TMDB match found. Try a different title or add a year.")
+        setSearchError(payload.ai
+          ? "AI could not suggest a confident match. Try manual search or Use as-is."
+          : "No TMDB match found. Try a different title or add a year.")
         return
       }
       onChange(index, {
@@ -86,6 +92,13 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
     if (!manualTitle.trim()) return
     rematch({ manual_title: manualTitle.trim(), manual_year: manualYear.trim() })
   }
+
+  const askAi = () => rematch({ ai: true })
+
+  const aiReady = aiSettings?.ai_enabled && aiSettings.ai_provider && (
+    (aiSettings.ai_provider === "openai" && aiSettings.openai_api_key) ||
+    (aiSettings.ai_provider === "anthropic" && aiSettings.anthropic_api_key)
+  )
 
   // Rebuild the name locally (no TMDB) using the typed title/year. Useful for
   // docs not in any database, or just to add a missing year for Plex matching.
@@ -148,6 +161,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   const isConflict = proposal.status === "conflict"
   const isCleanup = proposal.status === "cleanup"
   const isWeb = isCleanup && proposal.source === "wikipedia"
+  const isAiSource = proposal.source === "ai" || proposal.source === "ai+tmdb"
 
   return (
     <>
@@ -193,6 +207,9 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
             <div className="proposed-names">
               {isOrganised && <span className="organised-label">Already organised</span>}
               {isConflict && <span className="conflict-label">Target already exists - duplicate or wrong match</span>}
+              {isAiSource && proposal.ai_reason && (
+                <span className="ai-reason-label" title={proposal.ai_reason}>AI: {proposal.ai_reason}</span>
+              )}
               {isCleanup && (
                 <span className="cleanup-label">
                   {isWeb ? "Matched via Wikipedia - no TMDB result" : "Cleaned from filename - no TMDB match"}
@@ -210,7 +227,11 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
         </td>
 
         <td className="col-confidence">
-          {isCleanup ? (
+          {isAiSource ? (
+            <span className="ai-badge" title={proposal.source === "ai+tmdb" ? "AI suggested title, matched on TMDB" : "AI-suggested name"}>
+              AI{proposal.source === "ai+tmdb" ? "+TMDB" : ""}
+            </span>
+          ) : isCleanup ? (
             isWeb
               ? <span className="web-badge" title="Title/year from Wikipedia">Web</span>
               : <span className="local-badge" title="Named from the filename/folder; not verified against TMDB">Local</span>
@@ -328,6 +349,16 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
                   >
                     Use as-is
                   </button>
+                  <button
+                    className="btn-secondary"
+                    onClick={askAi}
+                    disabled={busy || !aiReady}
+                    title={aiReady
+                      ? "Ask your configured AI to interpret this filename and folder"
+                      : "Turn on AI in Settings and add an API key"}
+                  >
+                    {busy ? "…" : "Ask AI"}
+                  </button>
                 </div>
                 {searchError && <span className="field-error">{searchError}</span>}
               </div>
@@ -339,7 +370,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   )
 }
 
-export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds }) {
+export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, aiSettings }) {
   const [filter, setFilter] = useState("all") // all | matched | unmatched
   const [search, setSearch] = useState("")
   const [showOrganised, setShowOrganised] = useState(false)
@@ -448,6 +479,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
                 omdbKey={omdbKey}
                 split={split}
                 embedIds={embedIds}
+                aiSettings={aiSettings}
               />
             ))}
           </tbody>

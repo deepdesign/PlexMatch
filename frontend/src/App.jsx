@@ -24,6 +24,12 @@ const DEFAULT_SETTINGS = {
   split_libraries: true,
   embed_ids: true,
   omdb_api_key: "",
+  ai_enabled: false,
+  ai_provider: "",
+  openai_api_key: "",
+  anthropic_api_key: "",
+  ai_model: "",
+  openai_base_url: "",
 }
 
 // Statuses the user can approve and rename
@@ -136,6 +142,12 @@ export default function App() {
           split_libraries: settings.split_libraries,
           embed_ids: settings.embed_ids,
           omdb_api_key: settings.omdb_api_key,
+          ai_enabled: settings.ai_enabled,
+          ai_provider: settings.ai_provider,
+          openai_api_key: settings.openai_api_key,
+          anthropic_api_key: settings.anthropic_api_key,
+          ai_model: settings.ai_model,
+          openai_base_url: settings.openai_base_url,
         }),
       })
 
@@ -369,6 +381,14 @@ export default function App() {
               omdbKey={settings.omdb_api_key}
               split={settings.split_libraries}
               embedIds={settings.embed_ids}
+              aiSettings={{
+                ai_enabled: settings.ai_enabled,
+                ai_provider: settings.ai_provider,
+                openai_api_key: settings.openai_api_key,
+                anthropic_api_key: settings.anthropic_api_key,
+                ai_model: settings.ai_model,
+                openai_base_url: settings.openai_base_url,
+              }}
             />
           )}
 

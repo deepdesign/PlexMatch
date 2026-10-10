@@ -95,6 +95,7 @@ The `{tmdb-…}` folder tag is added when **Add TMDB/IMDb IDs to folder names** 
 - If a file has no TMDB match, it is flagged as unmatched - use the per-row manual search to correct it
 - With "Clean names without a TMDB match" enabled, unmatched files still get a best-effort Plex name built from the folder (title/year) and filename (season/episode/episode title). These rows are badged **Local** and are not auto-approved - review them before renaming
 - An optional **OMDb** key (free, IMDb-backed) is used as a fallback when TMDB has no confident match - it adds coverage for obscure docs, fills the `{imdb-...}` folder tag, and can supply episode names. Get a free key at [omdbapi.com](https://www.omdbapi.com/apikey.aspx)
+- Optional **AI** (OpenAI or Anthropic): pick one provider, sign in on their site, paste an API key. Used only on weak TMDB/OMDb matches (and via per-row **Ask AI**). Results are cached. Keys stay on this machine. OpenAI-compatible **base URL** is supported for Azure / Groq / local proxies.
 - "Look up unmatched titles on Wikipedia" (no API key needed) refines those names with a canonical title, year, and episode name when a Wikipedia article exists; such rows are badged **Web** with a Wikipedia link. Titles with no Wikipedia article fall back to the **Local** filename cleanup
 - Files already in the correct Plex location are flagged **organised** (hidden by default); a file whose target name is already taken is flagged a **conflict** so the rename never silently fails
 - Rows missing a year are flagged; expand the row and use **Use as-is** to apply a typed title/year (no TMDB needed) - handy for docs not in any database, or just to add a year for better Plex matching
@@ -110,7 +111,8 @@ The `{tmdb-…}` folder tag is added when **Add TMDB/IMDb IDs to folder names** 
 | POST   | `/api/settings`       | Save settings                                                  |
 | POST   | `/api/scan`           | Blocking scan (returns all proposals at once)                  |
 | POST   | `/api/scan/stream`    | Streaming scan via Server-Sent Events (one proposal at a time) |
-| POST   | `/api/rematch`        | Re-match one file by TMDB id (alternative) or manual title     |
+| POST   | `/api/rematch`        | Re-match one file by TMDB id, manual title, or `ai: true`      |
+| GET    | `/api/ai/console-urls`| OpenAI / Anthropic console URLs for signing in to create keys  |
 | POST   | `/api/rename`         | Execute approved moves; logs the batch, optional folder cleanup|
 | GET    | `/api/rename-log`     | List logged rename batches (most recent first)                 |
 | POST   | `/api/undo`           | Reverse a rename batch (defaults to the most recent)           |

@@ -3,6 +3,23 @@ import OrphanCleanup from "./OrphanCleanup"
 
 const API = "http://localhost:5174"
 
+const AI_PROVIDERS = {
+  openai: {
+    label: "OpenAI",
+    keyField: "openai_api_key",
+    keyPlaceholder: "sk-…",
+    keyUrl: "https://platform.openai.com/api-keys",
+    models: ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+  },
+  anthropic: {
+    label: "Anthropic",
+    keyField: "anthropic_api_key",
+    keyPlaceholder: "sk-ant-…",
+    keyUrl: "https://console.anthropic.com/settings/keys",
+    models: ["claude-3-5-haiku-20241022", "claude-sonnet-4-20250514", "claude-opus-4-20250514"],
+  },
+}
+
 export default function Settings({ settings, onChange, onScan, scanning, stage }) {
   const [folderValid, setFolderValid] = useState(null)
   const [validating, setValidating] = useState(false)
@@ -19,6 +36,33 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
   const update = (key, value) => {
     onChange({ ...settings, [key]: value })
   }
+
+  const toggleAi = () => {
+    const enabled = !settings.ai_enabled
+    onChange({
+      ...settings,
+      ai_enabled: enabled,
+      ai_provider: enabled && !settings.ai_provider ? "openai" : settings.ai_provider,
+    })
+  }
+
+  const changeProvider = (provider) => {
+    // Model names differ per provider, so reset to that provider's default
+    onChange({ ...settings, ai_provider: provider, ai_model: "" })
+  }
+
+  useEffect(() => {
+    if (settings.ai_enabled && !AI_PROVIDERS[settings.ai_provider]) {
+      onChange({ ...settings, ai_provider: "openai", ai_model: "" })
+    }
+  }, [settings.ai_enabled, settings.ai_provider])
+
+  const aiProvider = AI_PROVIDERS[settings.ai_provider]
+  const aiModels = aiProvider
+    ? (settings.ai_model && !aiProvider.models.includes(settings.ai_model)
+        ? [settings.ai_model, ...aiProvider.models]
+        : aiProvider.models)
+    : []
 
   const validateFolder = async (path) => {
     if (!path) return
@@ -156,6 +200,71 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
 
       <div className="settings-section">
         <h3 className="settings-heading">Options</h3>
+
+        <label className="toggle-row">
+          <div className="toggle-info">
+            <span className="toggle-label">Use AI when TMDB/OMDb can&apos;t match</span>
+            <span className="toggle-sub">Runs only on weak matches with your own OpenAI or Anthropic key; results are cached per file</span>
+          </div>
+          <button
+            role="switch"
+            aria-checked={!!settings.ai_enabled}
+            className={`toggle ${settings.ai_enabled ? "toggle--on" : ""}`}
+            onClick={toggleAi}
+          />
+        </label>
+
+        {settings.ai_enabled && aiProvider && (
+          <div className="ai-options">
+            <label className="field-label" htmlFor="ai-provider">Provider</label>
+            <select
+              id="ai-provider"
+              className="field-input"
+              value={settings.ai_provider}
+              onChange={e => changeProvider(e.target.value)}
+            >
+              {Object.entries(AI_PROVIDERS).map(([id, p]) => (
+                <option key={id} value={id}>{p.label}</option>
+              ))}
+            </select>
+
+            <label className="field-label" htmlFor="ai-key">{aiProvider.label} API key</label>
+            <div className="ai-key-row">
+              <input
+                id="ai-key"
+                type="password"
+                className="field-input"
+                placeholder={aiProvider.keyPlaceholder}
+                value={settings[aiProvider.keyField] || ""}
+                onChange={e => update(aiProvider.keyField, e.target.value)}
+              />
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => window.open(aiProvider.keyUrl, "_blank", "noopener,noreferrer")}
+                title={`Sign in to ${aiProvider.label} and create an API key`}
+              >
+                Get key ↗
+              </button>
+            </div>
+
+            <label className="field-label" htmlFor="ai-model">Model</label>
+            <select
+              id="ai-model"
+              className="field-input"
+              value={settings.ai_model || aiProvider.models[0]}
+              onChange={e => update("ai_model", e.target.value)}
+            >
+              {aiModels.map(m => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+
+            {!settings[aiProvider.keyField] && (
+              <span className="field-hint">Paste a key to start using AI. Keys are stored only on this machine.</span>
+            )}
+          </div>
+        )}
 
         <label className="toggle-row">
           <div className="toggle-info">
