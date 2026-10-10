@@ -22,7 +22,7 @@ function ConfidencePip({ value }) {
   )
 }
 
-function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, aiSettings }) {
+function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, nested }) {
   const [expanded, setExpanded] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
   const [manualYear, setManualYear] = useState("")
@@ -54,6 +54,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           parsed: proposal.parsed,
           split_libraries: split,
           embed_ids: embedIds,
+          restructure_folders: restructure,
           omdb_api_key: omdbKey,
           ...aiSettings,
           matched_title: proposal.matched_title,
@@ -119,6 +120,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           parsed: proposal.parsed,
           split_libraries: split,
           embed_ids: embedIds,
+          restructure_folders: restructure,
           local: true,
           manual_title: manualTitle.trim(),
           manual_year: manualYear.trim(),
@@ -165,7 +167,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
 
   return (
     <>
-      <tr className={`proposal-row ${isOrganised ? "row-organised" : isConflict ? "row-conflict" : proposal.approved ? "row-approved" : "row-rejected"} ${isUnmatched ? "row-unmatched" : ""}`}>
+      <tr className={`proposal-row ${nested ? "row-episode" : ""} ${isOrganised ? "row-organised" : isConflict ? "row-conflict" : proposal.approved ? "row-approved" : "row-rejected"} ${isUnmatched ? "row-unmatched" : ""}`}>
         <td className="col-approve">
           {isOrganised && (
             <span className="organised-icon" title="Already in Plex format - no rename needed">
@@ -370,8 +372,124 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   )
 }
 
-export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, aiSettings }) {
-  const [filter, setFilter] = useState("all") // all | matched | unmatched
+function needsAttention(p) {
+  if (p.status === "conflict" || p.status === "unmatched" || p.status === "error") return true
+  if (p.missing_year || p.needs_choice) return true
+  return p.confidence > 0 && p.confidence < 0.6 && p.status !== "organised"
+}
+
+function seasonKey(p) {
+  const season = p.season ?? p.parsed?.season
+  if (season == null) return null
+  if (p.type !== "tv" && !p.parsed?.is_tv) return null
+  const title = (p.matched_title || p.parsed?.title || "").trim().toLowerCase()
+  if (!title) return null
+  const year = p.matched_year || p.parsed?.year || ""
+  return `${title}|${year}|${season}`
+}
+
+function groupRows(list) {
+  const buckets = new Map()
+  const order = []
+  list.forEach((proposal, index) => {
+    const key = seasonKey(proposal)
+    if (!key) {
+      order.push({ kind: "file", proposal, index })
+      return
+    }
+    let group = buckets.get(key)
+    if (!group) {
+      group = { kind: "season", key, items: [] }
+      buckets.set(key, group)
+      order.push(group)
+    }
+    group.items.push({ proposal, index })
+  })
+  return order.flatMap(row => (
+    row.kind === "season" && row.items.length < 2
+      ? [{ kind: "file", proposal: row.items[0].proposal, index: row.items[0].index }]
+      : [row]
+  ))
+}
+
+const APPROVABLE_ROW = new Set(["pending", "cleanup"])
+
+function SeasonGroup({ group, rowProps, onSetApproved }) {
+  const [open, setOpen] = useState(false)
+  const first = group.items[0].proposal
+  const title = first.matched_title || first.parsed?.title || "Unknown show"
+  const year = first.matched_year || first.parsed?.year
+  const season = first.season ?? first.parsed?.season
+  const approvable = group.items.filter(item => APPROVABLE_ROW.has(item.proposal.status))
+  const approvedCount = approvable.filter(item => item.proposal.approved).length
+  const allOn = approvable.length > 0 && approvedCount === approvable.length
+  const mixed = approvedCount > 0 && !allOn
+  const label = `${title}${year ? ` (${year})` : ""} · Season ${String(season).padStart(2, "0")}`
+
+  const toggle = () => {
+    onSetApproved(approvable.map(item => item.proposal.full_path), !allOn)
+  }
+
+  return (
+    <>
+      <tr className="season-row">
+        <td className="col-approve">
+          {approvable.length === 0 ? (
+            <span className="organised-icon" title="Nothing in this season needs a rename">
+              <svg viewBox="0 0 14 14" fill="none"><path d="M2 7l4 4 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+            </span>
+          ) : (
+            <button
+              className={`approve-btn ${allOn ? "approved" : mixed ? "mixed" : "rejected"}`}
+              onClick={toggle}
+              title={allOn ? "Reject every episode in this season" : "Approve every episode in this season"}
+            >
+              {allOn
+                ? <svg viewBox="0 0 14 14" fill="none"><path d="M2 7l4 4 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                : mixed
+                  ? <svg viewBox="0 0 14 14" fill="none"><path d="M3 7h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+                  : <svg viewBox="0 0 14 14" fill="none"><path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>
+              }
+            </button>
+          )}
+        </td>
+        <td className="col-original">
+          <button type="button" className="season-toggle" onClick={() => setOpen(value => !value)}>
+            <svg className={`season-chevron ${open ? "open" : ""}`} viewBox="0 0 12 12" fill="none">
+              <path d="M4 2l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <span>{label}</span>
+          </button>
+        </td>
+        <td className="col-arrow" />
+        <td className="col-proposed">
+          <span className="season-count">{group.items.length} episodes</span>
+        </td>
+        <td className="col-confidence" />
+        <td className="col-tmdb" />
+        <td className="col-expand">
+          <button type="button" className="expand-btn" onClick={() => setOpen(value => !value)} title={open ? "Collapse season" : "Show episodes"}>
+            <svg viewBox="0 0 12 12" fill="none" style={{ transform: open ? "rotate(180deg)" : "none" }}>
+              <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+          </button>
+        </td>
+      </tr>
+      {open && group.items.map(item => (
+        <ProposalRow
+          key={item.proposal.full_path}
+          proposal={item.proposal}
+          index={item.index}
+          nested
+          {...rowProps}
+        />
+      ))}
+    </>
+  )
+}
+
+export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }) {
+  const [filter, setFilter] = useState(() => (proposals.some(needsAttention) ? "attention" : "all"))
   const [search, setSearch] = useState("")
   const [showOrganised, setShowOrganised] = useState(false)
 
@@ -383,6 +501,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
   const filtered = useMemo(() => {
     return proposals.filter(p => {
       if (!showOrganised && p.status === "organised") return false
+      if (filter === "attention" && !needsAttention(p)) return false
       if (filter === "matched" && (!p.matched || p.status === "unmatched")) return false
       if (filter === "unmatched" && p.matched && p.status !== "unmatched") return false
       if (search) {
@@ -395,7 +514,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
       }
       return true
     })
-  }, [proposals, filter, search])
+  }, [proposals, filter, search, showOrganised])
 
   const updateRow = (index, updated) => {
     // index here is into filtered, map back to original
@@ -415,6 +534,23 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
   ))
   const rejectAll = () => onChange(proposals.map(p => ({ ...p, approved: false })))
 
+  const setPathsApproved = (paths, approved) => {
+    const want = new Set(paths)
+    onChange(proposals.map(p => (
+      want.has(p.full_path) && APPROVABLE_ROW.has(p.status) ? { ...p, approved } : p
+    )))
+  }
+
+  const grouped = groupRows(filtered)
+  const attentionCount = proposals.filter(needsAttention).length
+  const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }
+  const tabs = [
+    ["attention", attentionCount ? `Needs attention (${attentionCount})` : "Needs attention"],
+    ["all", "All"],
+    ["matched", "Matched"],
+    ["unmatched", "Unmatched"],
+  ]
+
   return (
     <div className="proposal-panel">
       <div className="proposal-toolbar">
@@ -426,13 +562,13 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
             onChange={e => setSearch(e.target.value)}
           />
           <div className="filter-tabs">
-            {["all", "matched", "unmatched"].map(f => (
+            {tabs.map(([id, label]) => (
               <button
-                key={f}
-                className={`filter-tab ${filter === f ? "active" : ""}`}
-                onClick={() => setFilter(f)}
+                key={id}
+                className={`filter-tab ${filter === id ? "active" : ""}`}
+                onClick={() => setFilter(id)}
               >
-                {f.charAt(0).toUpperCase() + f.slice(1)}
+                {label}
               </button>
             ))}
           </div>
@@ -467,20 +603,22 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
             </tr>
           </thead>
           <tbody>
-            {filtered.map((p, i) => (
-              <ProposalRow
-                key={p.full_path}
-                proposal={p}
-                index={i}
-                onChange={updateRow}
-                onRemove={removeRow}
-                root={root}
-                apiKey={apiKey}
-                omdbKey={omdbKey}
-                split={split}
-                embedIds={embedIds}
-                aiSettings={aiSettings}
-              />
+            {grouped.map(row => (
+              row.kind === "season" ? (
+                <SeasonGroup
+                  key={row.key}
+                  group={row}
+                  rowProps={rowProps}
+                  onSetApproved={setPathsApproved}
+                />
+              ) : (
+                <ProposalRow
+                  key={row.proposal.full_path}
+                  proposal={row.proposal}
+                  index={row.index}
+                  {...rowProps}
+                />
+              )
             ))}
           </tbody>
         </table>

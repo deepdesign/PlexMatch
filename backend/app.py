@@ -445,6 +445,20 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
     }
 
 
+def needs_manual_pick(match: dict, auto_pick: bool) -> bool:
+    """When auto-pick is off, a weak or close call should wait for Review."""
+    if auto_pick or not match.get("matched"):
+        return False
+    confidence = match.get("confidence") or 0
+    if confidence < 0.8:
+        return True
+    for alt in match.get("alternatives") or []:
+        alt_confidence = alt.get("confidence") or 0
+        if alt_confidence >= 0.5 and alt_confidence >= confidence - 0.1:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Wikipedia fallback (free, no API key) - used when TMDB has no confident match
 # ---------------------------------------------------------------------------
@@ -984,6 +998,14 @@ def build_plex_names(match: dict, original_ext: str,
     return {"folder": folder, "filename": filename}
 
 
+def apply_layout(plex_names: dict, current_folder: str | None, restructure: bool) -> dict:
+    """When restructure is off, rename the file where it already sits."""
+    if restructure:
+        return plex_names
+    folder = current_folder if current_folder and current_folder != "." else ""
+    return {**plex_names, "folder": folder}
+
+
 # ---------------------------------------------------------------------------
 # File scanning
 # ---------------------------------------------------------------------------
@@ -1073,6 +1095,7 @@ def series_folder_name(full_path: str, root: str) -> str | None:
 
 def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
                         split: bool = False, embed_ids: bool = False,
+                        restructure: bool = True,
                         title_override: str | None = None,
                         year_override=None) -> dict | None:
     """
@@ -1144,7 +1167,10 @@ def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
         "episode": episode,
         "episode_name": episode_title or None,
     }
-    plex_names = build_plex_names(match_like, f["ext"], split, embed_ids)
+    plex_names = apply_layout(
+        build_plex_names(match_like, f["ext"], split, embed_ids),
+        f.get("folder"), restructure,
+    )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
     status = proposal_status(proposed_full_path, f["full_path"], default="cleanup")
 
@@ -1170,17 +1196,153 @@ def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
     }
 
 
+def _id_fields(tag: str | None) -> dict:
+    """Turn a folder tag like 'tmdb-123' or 'imdb-tt123' into match fields."""
+    if not tag:
+        return {}
+    kind, _, value = tag.partition("-")
+    if kind.lower() == "tmdb" and value.isdigit():
+        return {"tmdb_id": int(value)}
+    if kind.lower() == "imdb" and value.lower().startswith("tt"):
+        return {"imdb_id": value}
+    return {}
+
+
+def _strip_folder_id(name: str) -> tuple[str, str | None]:
+    match = re.search(r"\s\{(tmdb-\d+|imdb-tt\d+)\}$", name, re.IGNORECASE)
+    if not match:
+        return name, None
+    return name[: match.start()], match.group(1)
+
+
+_MOVIE_STEM = re.compile(r"^(?P<title>.+?) \((?P<year>(?:19|20)\d{2})\)$")
+_TV_STEM = re.compile(
+    r"^(?P<title>.+?) \((?P<year>(?:19|20)\d{2})\) - "
+    r"S(?P<season>\d{2})E(?P<episode>\d{2})(?: - (?P<episode_name>.+))?$"
+)
+
+
+def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
+                               restructure: bool) -> dict | None:
+    """A file whose path is already the name this scan would write.
+
+    Returning a proposal skips TMDB, OMDb and AI. Anything that doesn't already
+    match falls through to a normal lookup.
+    """
+    rel = f.get("rel_path") or ""
+    parts = Path(rel).parts
+    if not parts:
+        return None
+    stem = Path(parts[-1]).stem
+    ext = Path(parts[-1]).suffix
+    movie = _MOVIE_STEM.match(stem)
+    tv = _TV_STEM.match(stem)
+    if not movie and not tv:
+        return None
+
+    title = (movie or tv).group("title")
+    year = (movie or tv).group("year")
+    season = int(tv.group("season")) if tv else None
+    episode = int(tv.group("episode")) if tv else None
+    episode_name = tv.group("episode_name") if tv else None
+    ids: dict = {}
+
+    if restructure:
+        if movie:
+            if len(parts) < 2:
+                return None
+            show_base, tag = _strip_folder_id(parts[-2])
+            prefix = parts[:-2]
+            if show_base != f"{title} ({year})":
+                return None
+            if split and prefix != (MOVIES_DIR,):
+                return None
+            if not split and prefix:
+                return None
+        else:
+            if len(parts) < 3:
+                return None
+            if parts[-2] != f"Season {season:02d}":
+                return None
+            show_base, tag = _strip_folder_id(parts[-3])
+            prefix = parts[:-3]
+            if show_base != f"{title} ({year})":
+                return None
+            if split and prefix != (TV_DIR,):
+                return None
+            if not split and prefix:
+                return None
+        if embed_ids and not tag:
+            return None
+        if not embed_ids and tag:
+            return None
+        ids = _id_fields(tag)
+    elif embed_ids:
+        # Ids live on the folder. Without restructuring we can't confirm the tag
+        # belongs where this scan would put it, so look the file up.
+        return None
+
+    match = {
+        "matched_title": title,
+        "matched_year": year,
+        "type": "tv" if tv else "movie",
+        "season": season,
+        "episode": episode,
+        "episode_name": episode_name,
+        **ids,
+    }
+    plex = build_plex_names(match, ext, split and restructure, embed_ids and restructure)
+    if not restructure:
+        current = f.get("folder") if f.get("folder") not in (None, ".") else ""
+        plex = {**plex, "folder": current}
+    proposed = os.path.join(root, plex["folder"], plex["filename"])
+    if os.path.normcase(os.path.normpath(proposed)) != os.path.normcase(os.path.normpath(f["full_path"])):
+        return None
+
+    return {
+        **f,
+        "parsed": {
+            "title": title,
+            "year": int(year),
+            "season": season,
+            "episode": episode,
+            "is_tv": bool(tv),
+            "country": None,
+        },
+        "matched": True,
+        "confidence": 1,
+        "type": match["type"],
+        "matched_title": title,
+        "matched_year": year,
+        "tmdb_id": ids.get("tmdb_id"),
+        "imdb_id": ids.get("imdb_id"),
+        "episode_name": episode_name,
+        "season": season,
+        "episode": episode,
+        "proposed_folder": plex["folder"],
+        "proposed_filename": plex["filename"],
+        "proposed_full_path": proposed,
+        "missing_year": False,
+        "status": "organised",
+        "skipped_lookup": True,
+    }
+
+
 def build_proposal(f: dict, root: str, api_key: str,
                    clean_unmatched: bool = False, web_lookup: bool = False,
                    split: bool = False, embed_ids: bool = False,
-                   omdb_key: str = "", ai_cfg: dict | None = None) -> dict:
+                   omdb_key: str = "", ai_cfg: dict | None = None,
+                   restructure: bool = True, auto_pick: bool = True) -> dict:
     """Match a single scanned file against TMDB, OMDb, AI, then local cleanup."""
+    organised = already_organised_proposal(f, root, split, embed_ids, restructure)
+    if organised:
+        return organised
     ai_cfg = ai_cfg or {"enabled": False}
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
     if not parsed["title"]:
         if do_cleanup:
-            cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids)
+            cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids, restructure)
             if cleanup:
                 return cleanup
         return {
@@ -1223,12 +1385,15 @@ def build_proposal(f: dict, root: str, api_key: str,
 
     if not match["matched"] or match["confidence"] < 0.3:
         if do_cleanup:
-            cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids)
+            cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids, restructure)
             if cleanup:
                 return cleanup
         return {**f, "parsed": parsed, **match, "status": "unmatched"}
 
-    plex_names = build_plex_names(match, f["ext"], split, embed_ids)
+    plex_names = apply_layout(
+        build_plex_names(match, f["ext"], split, embed_ids),
+        f.get("folder"), restructure,
+    )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
     status = proposal_status(proposed_full_path, f["full_path"], default="pending")
 
@@ -1240,6 +1405,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         "proposed_filename": plex_names["filename"],
         "proposed_full_path": proposed_full_path,
         "missing_year": not match.get("matched_year"),
+        "needs_choice": needs_manual_pick(match, auto_pick),
         "status": status,
     }
 
@@ -1351,9 +1517,100 @@ def find_orphan_folders(root: str) -> list:
     return orphans
 
 
+# Files a release folder often ships that Plex never uses. Subtitles, artwork
+# and .nfo stay, because Plex and the renamer treat those as part of the title.
+JUNK_EXTENSIONS = {
+    ".txt", ".text", ".md", ".markdown", ".rtf", ".html", ".htm",
+    ".url", ".lnk", ".webloc", ".website",
+    ".diz", ".sfv", ".md5", ".sha", ".sha1", ".sha256", ".par2",
+    ".torrent", ".nzb", ".srr",
+    ".log", ".exe", ".bat", ".cmd", ".com", ".scr",
+    ".pdf", ".doc", ".docx",
+    ".m3u", ".m3u8", ".pls", ".cue",
+    ".ini", ".db",
+}
+JUNK_NAMES = {
+    "thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store",
+    "readme", "read.me",
+}
+_README_EXT = {".txt", ".text", ".md", ".markdown", ".rtf", ".diz", ".html", ".htm", ".pdf", ".doc", ".docx"}
+_LINK_EXT = {".url", ".lnk", ".webloc", ".website"}
+_RELEASE_EXT = {".sfv", ".md5", ".sha", ".sha1", ".sha256", ".par2", ".torrent", ".nzb", ".srr", ".cue"}
+
+
+def junk_kind(filename: str) -> str | None:
+    """Why this file is junk, or None if it should be kept."""
+    lower = filename.lower()
+    suffix = Path(filename).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS or suffix in SIDECAR_EXTENSIONS:
+        return None
+    if lower not in JUNK_NAMES and suffix not in JUNK_EXTENSIONS:
+        return None
+    if suffix in _LINK_EXT:
+        return "Shortcut"
+    if suffix in _README_EXT or lower.startswith("readme") or lower == "read.me":
+        return "Readme"
+    if suffix in _RELEASE_EXT:
+        return "Release file"
+    return "Junk file"
+
+
+def find_junk_files(root: str) -> list:
+    """Readmes, shortcuts and other non-media files under root."""
+    found = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            kind = junk_kind(name)
+            if not kind:
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            found.append({
+                "path": path,
+                "rel_path": os.path.relpath(path, root),
+                "name": name,
+                "kind": kind,
+                "size": size,
+            })
+    found.sort(key=lambda item: item["rel_path"].lower())
+    return found
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
+
+_SKIP_MODEL = re.compile(
+    r"realtime|audio|transcribe|tts|image|embed|whisper|moderation|dall-e|sora",
+    re.IGNORECASE,
+)
+
+
+def _chat_model_ids(provider: str, response) -> list[str]:
+    """Chat model ids from a provider's /models response. Presets stay first in the UI."""
+    try:
+        rows = response.json().get("data") or []
+    except ValueError:
+        return []
+    ids = []
+    for item in rows:
+        model_id = (item.get("id") or "").strip()
+        if not model_id:
+            continue
+        low = model_id.lower()
+        if provider == "openai":
+            if not (low.startswith("gpt-") or low.startswith(("o1", "o3", "o4", "chatgpt-"))):
+                continue
+            if _SKIP_MODEL.search(low):
+                continue
+        elif not low.startswith("claude-"):
+            continue
+        ids.append(model_id)
+    return sorted(set(ids), key=str.lower)
+
 
 @app.route("/api/ai/console-urls", methods=["GET"])
 def ai_console_urls():
@@ -1388,9 +1645,21 @@ def ai_verify_key():
         return jsonify({"valid": False, "error": "Couldn't reach the provider. Check your connection."})
 
     if r.status_code == 200:
-        return jsonify({"valid": True})
+        return jsonify({"valid": True, "models": _chat_model_ids(provider, r)})
     if r.status_code in (401, 403):
         return jsonify({"valid": False, "error": "Key not recognised. Check it was copied in full."})
+
+    try:
+        message = (r.json().get("error") or {}).get("message") or ""
+    except ValueError:
+        message = ""
+    if "workspace" in message.lower():
+        return jsonify({"valid": False, "error": (
+            "This Anthropic key isn't attached to a workspace. In the Anthropic Console, "
+            "create a new key inside a workspace (e.g. Default) and paste that instead."
+        )})
+    if message:
+        return jsonify({"valid": False, "error": f"{message} ({r.status_code})"})
     return jsonify({"valid": False, "error": f"Provider returned an error ({r.status_code}). Try again shortly."})
 
 
@@ -1410,6 +1679,8 @@ def scan():
     web_lookup = bool(data.get("web_lookup", False))
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
+    restructure = bool(data.get("restructure_folders", True))
+    auto_pick = bool(data.get("auto_pick_top", True))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     files = scan_directory(root)
@@ -1417,7 +1688,7 @@ def scan():
         # executor.map preserves input order
         proposals = list(executor.map(
             lambda f: build_proposal(
-                f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key, ai_cfg
+                f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick
             ),
             files,
         ))
@@ -1448,6 +1719,8 @@ def scan_stream():
     web_lookup = bool(data.get("web_lookup", False))
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
+    restructure = bool(data.get("restructure_folders", True))
+    auto_pick = bool(data.get("auto_pick_top", True))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     files = scan_directory(root)
@@ -1457,18 +1730,21 @@ def scan_stream():
 
     def generate():
         yield sse({"type": "start", "total": len(files), "root": root})
-        # Match files concurrently (TMDB calls are network-bound) and stream
-        # each proposal as soon as it's ready.
-        with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
-            futures = {
-                executor.submit(
-                    build_proposal, f, root, api_key, clean_unmatched, web_lookup,
-                    split, embed_ids, omdb_key, ai_cfg,
-                ): i
-                for i, f in enumerate(files)
-            }
+        # Match files concurrently. Cancel anything not yet started if the
+        # client stops the scan; a file already in flight finishes.
+        executor = ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY)
+        futures = {
+            executor.submit(
+                build_proposal, f, root, api_key, clean_unmatched, web_lookup,
+                split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick,
+            ): i
+            for i, f in enumerate(files)
+        }
+        try:
             for future in as_completed(futures):
                 i = futures[future]
+                if future.cancelled():
+                    continue
                 try:
                     proposal = future.result()
                 except Exception as e:  # defensive: never break the stream
@@ -1477,7 +1753,11 @@ def scan_stream():
                         "status": "error", "error": str(e),
                     }
                 yield sse({"type": "proposal", "index": i, "proposal": proposal})
-        yield sse({"type": "done"})
+            yield sse({"type": "done"})
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return Response(
         stream_with_context(generate()),
@@ -1502,6 +1782,7 @@ def rematch():
     parsed = data.get("parsed") or {}
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
+    restructure = bool(data.get("restructure_folders", True))
 
     tmdb_id = data.get("tmdb_id")
     media_type = data.get("media_type")
@@ -1523,6 +1804,7 @@ def rematch():
             year_override = int(str(manual_year).strip())
         cleanup = build_local_cleanup(
             f, root, web_lookup=False, split=split, embed_ids=embed_ids,
+            restructure=restructure,
             title_override=manual_title or None, year_override=year_override,
         )
         if not cleanup:
@@ -1601,7 +1883,10 @@ def rematch():
     if not match or not match.get("matched"):
         return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
 
-    plex_names = build_plex_names(match, ext, split, embed_ids)
+    plex_names = apply_layout(
+        build_plex_names(match, ext, split, embed_ids),
+        data.get("folder"), restructure,
+    )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
 
     def _norm(p):
@@ -1623,6 +1908,44 @@ def rematch():
         "missing_year": not match.get("matched_year"),
         "status": status,
     })
+
+
+# Same-folder companions that belong with a video (subs, artwork, nfo).
+SIDECAR_EXTENSIONS = {
+    ".srt", ".ass", ".ssa", ".sub", ".idx", ".sup", ".vtt",
+    ".nfo", ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+}
+
+
+def sidecar_paths(video_path: str) -> list:
+    """Companion files beside a video, as (path, suffix after the video stem).
+
+    `Show.mkv` picks up `Show.en.srt` and `Show.jpg`, not `Other.srt` or another video.
+    """
+    folder = os.path.dirname(video_path)
+    stem = Path(video_path).stem
+    if not stem or not os.path.isdir(folder):
+        return []
+    stem_cf = stem.casefold()
+    found = []
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return []
+    for name in entries:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if not name.casefold().startswith(stem_cf) or len(name) <= len(stem):
+            continue
+        rest = name[len(stem):]
+        if not rest.startswith("."):
+            continue
+        suffix = Path(name).suffix.lower()
+        if suffix in VIDEO_EXTENSIONS or suffix not in SIDECAR_EXTENSIONS:
+            continue
+        found.append((path, rest))
+    return found
 
 
 @app.route("/api/rename", methods=["POST"])
@@ -1649,11 +1972,23 @@ def rename():
                 continue
             if os.path.exists(dst):
                 raise FileExistsError(f"Target already exists: {dst}")
+            companions = sidecar_paths(src)
             dst_dir = os.path.dirname(dst)
             os.makedirs(dst_dir, exist_ok=True)
             shutil.move(src, dst)
             results.append({"src": src, "dst": dst, "ok": True})
             moves.append({"src": src, "dst": dst})
+            new_stem = Path(dst).stem
+            for side_src, rest in companions:
+                side_dst = os.path.join(dst_dir, new_stem + rest)
+                try:
+                    if os.path.exists(side_dst):
+                        raise FileExistsError(f"Target already exists: {side_dst}")
+                    shutil.move(side_src, side_dst)
+                    results.append({"src": side_src, "dst": side_dst, "ok": True, "sidecar": True})
+                    moves.append({"src": side_src, "dst": side_dst})
+                except Exception as e:
+                    results.append({"src": side_src, "dst": side_dst, "ok": False, "error": str(e), "sidecar": True})
         except Exception as e:
             results.append({"src": src, "dst": dst, "ok": False, "error": str(e)})
 
@@ -1796,6 +2131,49 @@ def orphan_folders():
     if not root or not os.path.isdir(root):
         return jsonify({"error": f"Folder not found: {root}"}), 400
     return jsonify({"folders": find_orphan_folders(root)})
+
+
+@app.route("/api/junk-files", methods=["POST"])
+def junk_files():
+    """Preview readmes, shortcuts and release leftovers. Nothing is deleted."""
+    data = request.json or {}
+    root = (data.get("root_folder") or "").strip()
+    if not root or not os.path.isdir(root):
+        return jsonify({"error": f"Folder not found: {root}"}), 400
+    return jsonify({"files": find_junk_files(root)})
+
+
+@app.route("/api/delete-junk", methods=["POST"])
+def delete_junk():
+    """
+    Delete the given files, but only if each one still classifies as junk and
+    lives inside root. A video, subtitle, poster or .nfo is never removed.
+    Body: { root_folder, files: [<abs path>, ...] }
+    """
+    data = request.json or {}
+    root = (data.get("root_folder") or "").strip()
+    files = data.get("files") or []
+
+    if not root or not os.path.isdir(root):
+        return jsonify({"error": f"Folder not found: {root}"}), 400
+
+    root_abs = os.path.abspath(root)
+    results = []
+    for fpath in files:
+        target = os.path.abspath(fpath)
+        try:
+            if target == root_abs or os.path.commonpath([root_abs, target]) != root_abs:
+                raise ValueError("File is outside the library root")
+            if not os.path.isfile(target):
+                raise FileNotFoundError("File no longer exists")
+            if not junk_kind(os.path.basename(target)):
+                raise ValueError("File is not junk - skipped")
+            os.remove(target)
+            results.append({"path": fpath, "ok": True})
+        except Exception as e:  # noqa: BLE001 - report any failure per-file
+            results.append({"path": fpath, "ok": False, "error": str(e)})
+
+    return jsonify({"results": results})
 
 
 @app.route("/api/delete-folders", methods=["POST"])

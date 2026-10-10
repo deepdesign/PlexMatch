@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import Settings from "./components/Settings"
 import ScanPanel from "./components/ScanPanel"
 import ProposalTable from "./components/ProposalTable"
@@ -34,6 +34,79 @@ const DEFAULT_SETTINGS = {
 
 // Statuses the user can approve and rename
 const APPROVABLE = new Set(["pending", "cleanup"])
+
+function pathInside(file, folder) {
+  const norm = (p) => p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase()
+  const target = norm(file)
+  const dir = norm(folder)
+  return target === dir || target.startsWith(`${dir}/`)
+}
+
+function plexLibraryPaths(root, results) {
+  if (!root) return []
+  const sep = root.includes("\\") ? "\\" : "/"
+  const base = root.replace(/[\\/]+$/, "")
+  return ["Movies", "TV"].flatMap(name => {
+    const folder = `${base}${sep}${name}`
+    const used = (results || []).some(r => r.ok && r.dst && pathInside(r.dst, folder))
+    return used ? [{ label: name, path: folder }] : []
+  })
+}
+
+function CopyPath({ label, path }) {
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 1500)
+    return () => clearTimeout(timer)
+  }, [copied])
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(path)
+      setCopied(true)
+      return
+    } catch {
+      // Clipboard API can be blocked; fall back to the legacy command.
+    }
+    const field = document.createElement("textarea")
+    field.value = path
+    field.setAttribute("readonly", "")
+    field.style.position = "fixed"
+    field.style.opacity = "0"
+    document.body.appendChild(field)
+    field.select()
+    const ok = document.execCommand("copy")
+    document.body.removeChild(field)
+    if (ok) setCopied(true)
+  }
+
+  return (
+    <div className="library-path">
+      <span className="library-path-label">{label}</span>
+      <code className="library-path-value">{path}</code>
+      <button
+        type="button"
+        className={`library-path-copy ${copied ? "library-path-copy--done" : ""}`}
+        onClick={copy}
+        title={copied ? "Copied" : `Copy ${label} path`}
+        aria-label={copied ? "Copied" : `Copy ${label} path`}
+      >
+        {copied ? (
+          <svg viewBox="0 0 16 16" fill="none">
+            <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        ) : (
+          <svg viewBox="0 0 16 16" fill="none">
+            <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.3"/>
+            <path d="M10.5 3.5v-.5A1.5 1.5 0 009 1.5H4A1.5 1.5 0 002.5 3v5A1.5 1.5 0 004 9.5h.5" stroke="currentColor" strokeWidth="1.3"/>
+          </svg>
+        )}
+      </button>
+    </div>
+  )
+}
 
 function readCachedSettings() {
   try {
@@ -77,9 +150,20 @@ export default function App() {
         const res = await fetch(`${API}/api/settings`)
         const s = await res.json()
         const merged = { ...DEFAULT_SETTINGS, ...s }
-        // Keep a locally-stored key if the backend somehow has none
-        if (!merged.tmdb_api_key && cached?.tmdb_api_key) {
-          merged.tmdb_api_key = cached.tmdb_api_key
+        // Keep locally-stored keys if the backend somehow has none
+        let restored = false
+        for (const k of ["tmdb_api_key", "omdb_api_key", "openai_api_key", "anthropic_api_key"]) {
+          if (!merged[k] && cached?.[k]) {
+            merged[k] = cached[k]
+            restored = true
+          }
+        }
+        if (restored) {
+          fetch(`${API}/api/settings`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(merged),
+          }).catch(() => {})
         }
         // Self-heal: drop a stored library folder that no longer exists on disk
         if (merged.root_folder) {
@@ -119,7 +203,16 @@ export default function App() {
     }
   }, [])
 
+  const scanAbort = useRef(null)
+
+  const stopScan = useCallback(() => {
+    scanAbort.current?.abort()
+  }, [])
+
   const handleScan = useCallback(async (rootOverride) => {
+    scanAbort.current?.abort()
+    const controller = new AbortController()
+    scanAbort.current = controller
     setError(null)
     setProposals([])
     setRenameResults([])
@@ -129,11 +222,13 @@ export default function App() {
     setStage(1)
 
     const root = rootOverride || settings.root_folder
+    let received = 0
 
     try {
       const res = await fetch(`${API}/api/scan/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           root_folder: root,
           tmdb_api_key: settings.tmdb_api_key,
@@ -141,6 +236,8 @@ export default function App() {
           web_lookup: settings.web_lookup,
           split_libraries: settings.split_libraries,
           embed_ids: settings.embed_ids,
+          restructure_folders: settings.restructure_folders,
+          auto_pick_top: settings.auto_pick_top,
           omdb_api_key: settings.omdb_api_key,
           ai_enabled: settings.ai_enabled,
           ai_provider: settings.ai_provider,
@@ -178,9 +275,10 @@ export default function App() {
             setScanRoot(msg.root)
             setScanProgress({ current: 0, total: msg.total })
           } else if (msg.type === "proposal") {
+            received += 1
             const p = {
               ...msg.proposal,
-              approved: msg.proposal.status === "pending",
+              approved: msg.proposal.status === "pending" && !msg.proposal.needs_choice,
               selectedAlt: null,
             }
             setProposals(prev => [...prev, p])
@@ -193,9 +291,14 @@ export default function App() {
 
       setStage(2)
     } catch (e) {
+      if (e.name === "AbortError") {
+        setStage(received > 0 ? 2 : 0)
+        return
+      }
       setError(e.message)
       setStage(0)
     } finally {
+      if (scanAbort.current === controller) scanAbort.current = null
       setScanning(false)
     }
   }, [settings])
@@ -266,6 +369,9 @@ export default function App() {
   const unmatchedCount = proposals.filter(p => !p.matched && p.status !== "cleanup").length
   const organisedCount = proposals.filter(p => p.status === "organised").length
   const conflictCount = proposals.filter(p => p.status === "conflict").length
+  const plexLibraries = settings && lastBatch && settings.split_libraries && settings.restructure_folders
+    ? plexLibraryPaths(scanRoot, renameResults)
+    : []
 
   if (!settings) {
     return (
@@ -312,8 +418,8 @@ export default function App() {
             settings={settings}
             onChange={saveSettings}
             onScan={handleScan}
+            onStop={stopScan}
             scanning={scanning}
-            stage={stage}
           />
         </aside>
 
@@ -341,7 +447,7 @@ export default function App() {
                 </svg>
               </div>
               <h2>Configure and scan your library</h2>
-              <p>Enter your TMDB API key and library folder path in the panel on the left, then click <strong>Scan Library</strong>.</p>
+              <p>Choose a library folder on the left, then click <strong>Scan Library</strong>. Open a group to change matching, folders, or API keys.</p>
             </div>
           )}
 
@@ -369,6 +475,9 @@ export default function App() {
                   <p className="scan-sub">This may take a moment for large libraries.</p>
                 </>
               )}
+              <button type="button" className="btn-secondary" onClick={stopScan}>
+                Stop scan
+              </button>
             </div>
           )}
 
@@ -381,6 +490,7 @@ export default function App() {
               omdbKey={settings.omdb_api_key}
               split={settings.split_libraries}
               embedIds={settings.embed_ids}
+              restructure={settings.restructure_folders}
               aiSettings={{
                 ai_enabled: settings.ai_enabled,
                 ai_provider: settings.ai_provider,
@@ -409,6 +519,18 @@ export default function App() {
                 </span>
               </h2>
               {resultNote && <p className="result-note">{resultNote}</p>}
+              {plexLibraries.length > 0 && (
+                <div className="library-paths">
+                  <p className="library-paths-note">
+                    {plexLibraries.length > 1
+                      ? "Add each folder as its own Plex library."
+                      : "Add this folder as its own Plex library."}
+                  </p>
+                  {plexLibraries.map(lib => (
+                    <CopyPath key={lib.label} label={lib.label} path={lib.path} />
+                  ))}
+                </div>
+              )}
               <div className="results-list">
                 {renameResults.map((r, i) => (
                   <div key={i} className={`result-row ${r.ok ? "ok" : "fail"}`}>
