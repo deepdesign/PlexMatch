@@ -1,5 +1,5 @@
 """
-Plex Documentary Renamer - Flask Backend
+PlexMatch - Plex Media Renamer - Flask Backend
 ----------------------------------------
 Scans a folder, matches files against TMDB (movies + TV),
 proposes Plex-compliant renames, and executes approved ones.
@@ -120,21 +120,32 @@ PART_PATTERN = re.compile(r"\b(?:part|pt|episode|ep)\s*\.?\s*(\d{1,2})\b", re.IG
 # search hint (e.g. a single episode inside a "Season 01" folder).
 SEASON_FOLDER_PATTERN = re.compile(r"^(season[\s._-]*\d+|specials|s\d{1,2})$", re.IGNORECASE)
 
+# Library-level folder names that never describe a single title, so they must
+# not be used as a search hint for a lone video file inside them.
+GENERIC_LIBRARY_FOLDERS = {
+    "movies", "films", "tv", "tv shows", "tv series", "series", "shows",
+    "documentaries", "docs", "kids", "anime", "downloads", "media", "videos",
+}
+
 # "sample" as a whole token in a filename stem -> a throwaway preview clip
 SAMPLE_PATTERN = re.compile(r"(?:^|[\s._-])sample(?:[\s._-]|$)", re.IGNORECASE)
 
 # An embedded IMDb rating tag, e.g. "IMDB 8.2" / "imdb8.1"
 IMDB_RATING_PATTERN = re.compile(r"\bimdb\b\s*\d+(?:\.\d+)?", re.IGNORECASE)
 
-# Bracketed scene tags, e.g. "[rartv]", "[RARBG]", "(1080p)"
-BRACKET_TAG_PATTERN = re.compile(r"[\[(][^\])]*[\])]")
+# Bracketed scene tags, e.g. "[rartv]", "[RARBG]", "(1080p)". A bare year in
+# parentheses - "The Matrix (1999)" - is kept so it can be parsed as the year.
+BRACKET_TAG_PATTERN = re.compile(r"\[[^\]]*\]|\((?!\s*(?:19|20)\d{2}\s*\))[^)]*\)")
 # A trailing scene release group after the final hyphen, e.g. "x264-SHORTBREHD".
 # Only stripped from dot-separated scene names so real titles (e.g. "Spider-Man")
 # survive once their year/extension have been removed.
 SCENE_GROUP_PATTERN = re.compile(r"-[A-Za-z0-9]{2,}$")
 # A trailing country/region tag scene releases add to disambiguate a remake,
-# e.g. "The.Planets.UK.2019" -> "The Planets". Only applied to multi-word titles.
-COUNTRY_SUFFIX_PATTERN = re.compile(r"\s+(?:UK|US|USA|AU|CA|NZ)$", re.IGNORECASE)
+# e.g. "The.Office.UK" -> "The Office". Only applied to multi-word titles; the
+# country is kept as a hint to pick the right show from TMDB's results.
+COUNTRY_SUFFIX_PATTERN = re.compile(r"\s+(UK|US|USA|AU|CA|NZ)$", re.IGNORECASE)
+# Scene tag -> ISO 3166 code used in TMDB's origin_country
+COUNTRY_CODES = {"UK": "GB", "US": "US", "USA": "US", "AU": "AU", "CA": "CA", "NZ": "NZ"}
 
 
 def strip_scene_group(text: str) -> str:
@@ -228,9 +239,13 @@ def parse_filename(raw: str) -> dict:
     name = re.sub(r"\s+", " ", name).strip()
     # Remove trailing/leading hyphens and brackets
     name = re.sub(r"^[\s\-\[\]\(\)]+|[\s\-\[\]\(\)]+$", "", name).strip()
-    # Drop a trailing country tag scene releases add (e.g. "The Planets UK")
+    # Drop a trailing country tag scene releases add (e.g. "The Office UK")
+    country = None
     if len(name.split()) >= 2:
-        name = COUNTRY_SUFFIX_PATTERN.sub("", name).strip()
+        cm = COUNTRY_SUFFIX_PATTERN.search(name)
+        if cm:
+            country = COUNTRY_CODES[cm.group(1).upper()]
+            name = name[: cm.start()].strip()
 
     return {
         "title": name,
@@ -238,6 +253,7 @@ def parse_filename(raw: str) -> dict:
         "season": season,
         "episode": episode,
         "is_tv": is_tv,
+        "country": country,
     }
 
 
@@ -321,9 +337,11 @@ def build_match_from_details(details: dict, media_type: str, parsed: dict, api_k
     }
 
 
-def score_result(result: dict, parsed_title: str, parsed_year: int | None, is_tv: bool) -> float:
+def score_result(result: dict, parsed_title: str, parsed_year: int | None, is_tv: bool,
+                 country: str | None = None) -> float:
     """
-    Simple confidence score 0-1 based on title similarity and year match.
+    Simple confidence score 0-1 based on title similarity and year match,
+    nudged by country of origin when the filename carried a tag like "UK".
     """
     from difflib import SequenceMatcher
 
@@ -344,7 +362,13 @@ def score_result(result: dict, parsed_title: str, parsed_year: int | None, is_tv
     elif parsed_year and not candidate_year:
         year_score = 0.8
 
-    return round(title_score * 0.7 + year_score * 0.3, 3)
+    score = title_score * 0.7 + year_score * 0.3
+
+    origins = result.get("origin_country") or []
+    if country and origins:
+        score += 0.1 if country in origins else -0.15
+
+    return round(max(0.0, min(1.0, score)), 3)
 
 
 def find_best_match(parsed: dict, api_key: str) -> dict:
@@ -365,7 +389,7 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
     for r in tmdb_search_tv(title, year, api_key):
         candidates.append({"result": r, "type": "tv"})
 
-    # If TV-patterned, also check movies (some docs use SxxExx loosely)
+    # If TV-patterned, also check movies (some releases use SxxExx loosely)
     if is_tv:
         for r in tmdb_search_movie(title, year, api_key):
             candidates.append({"result": r, "type": "movie"})
@@ -375,7 +399,7 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
 
     scored = []
     for c in candidates:
-        score = score_result(c["result"], title, year, is_tv)
+        score = score_result(c["result"], title, year, is_tv, parsed.get("country"))
         scored.append({**c, "confidence": score})
 
     scored.sort(key=lambda x: x["confidence"], reverse=True)
@@ -426,7 +450,7 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
 # ---------------------------------------------------------------------------
 
 WIKI_API = "https://en.wikipedia.org/w/api.php"
-WIKI_HEADERS = {"User-Agent": "PlexMatch/1.0 (local documentary renamer)"}
+WIKI_HEADERS = {"User-Agent": "PlexMatch/1.1 (local Plex media renamer)"}
 
 
 @lru_cache(maxsize=512)
@@ -648,7 +672,7 @@ AI_CONSOLE_URLS = {
     "anthropic": "https://console.anthropic.com/settings/keys",
 }
 
-AI_SYSTEM_PROMPT = """You help organize documentary video files for Plex media servers.
+AI_SYSTEM_PROMPT = """You help organize video files (movies, TV series, documentaries) for Plex media servers.
 Given folder context, filename, and parsed hints, respond with ONLY a JSON object (no markdown).
 Required keys:
   canonical_title (string),
@@ -660,10 +684,10 @@ Required keys:
   confidence (number 0-1),
   reason (one short sentence explaining your choice).
 Rules:
-- Multi-part series (SxxExx, NofM, Part N) are usually media_type "tv".
-- Standalone feature documentaries are usually "movie".
+- Episodic content (SxxExx, NofM, Part N, Episode N) is usually media_type "tv".
+- Standalone feature films, including feature documentaries, are usually "movie".
 - Strip release groups, codecs, resolution, [bracket tags], and scene country tags (UK/US) unless part of the official title.
-- Prefer well-known English broadcast titles (BBC, PBS, etc.)."""
+- Use the official English title as listed on TMDB or IMDb."""
 
 
 _ai_result_cache: dict[str, dict | None] = {}
@@ -763,7 +787,7 @@ def _call_anthropic_chat(api_key: str, model: str, user_prompt: str) -> str:
     return "".join(parts)
 
 
-def ai_infer_documentary(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict) -> dict | None:
+def ai_infer_media(f: dict, parsed: dict, prior_match: dict | None, ai_cfg: dict) -> dict | None:
     """
     Ask the configured AI provider to infer canonical Plex metadata.
     Results are cached per file + parsed hints (no API key in cache key).
@@ -864,7 +888,7 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
     if not weak or not ai_cfg.get("enabled"):
         return None
 
-    inference = ai_infer_documentary(f, parsed, prior_match, ai_cfg)
+    inference = ai_infer_media(f, parsed, prior_match, ai_cfg)
     if not inference or inference["confidence"] < 0.55:
         return None
 
@@ -999,7 +1023,7 @@ def scan_directory(root: str) -> list:
             folder_name = Path(dirpath).name
             use_folder_as_hint = (
                 len(video_files) == 1
-                and folder_name.lower() not in {"documentaries", os.path.basename(root).lower()}
+                and folder_name.lower() not in GENERIC_LIBRARY_FOLDERS | {os.path.basename(root).lower()}
                 and not SEASON_FOLDER_PATTERN.match(folder_name.strip())
             )
 
@@ -1335,6 +1359,39 @@ def find_orphan_folders(root: str) -> list:
 def ai_console_urls():
     """Browser URLs where users sign in and create API keys (no OAuth in-app)."""
     return jsonify(AI_CONSOLE_URLS)
+
+
+@app.route("/api/ai/verify-key", methods=["POST"])
+def ai_verify_key():
+    """
+    Check an AI API key by listing models - a free call on both providers, so
+    verifying never spends credit. Body: { provider, api_key, base_url? }
+    """
+    data = request.json or {}
+    provider = (data.get("provider") or "").strip().lower()
+    api_key = (data.get("api_key") or "").strip()
+    if provider not in ("openai", "anthropic"):
+        return jsonify({"valid": False, "error": "Unknown provider"}), 400
+    if not api_key:
+        return jsonify({"valid": False, "error": "No key entered"}), 400
+
+    try:
+        if provider == "openai":
+            root = (data.get("base_url") or "").strip().rstrip("/") or "https://api.openai.com/v1"
+            r = requests.get(f"{root}/models",
+                             headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        else:
+            r = requests.get("https://api.anthropic.com/v1/models",
+                             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+                             timeout=10)
+    except requests.RequestException:
+        return jsonify({"valid": False, "error": "Couldn't reach the provider. Check your connection."})
+
+    if r.status_code == 200:
+        return jsonify({"valid": True})
+    if r.status_code in (401, 403):
+        return jsonify({"valid": False, "error": "Key not recognised. Check it was copied in full."})
+    return jsonify({"valid": False, "error": f"Provider returned an error ({r.status_code}). Try again shortly."})
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -1682,7 +1739,7 @@ initial = sys.argv[1] if len(sys.argv) > 1 else ""
 root = tk.Tk()
 root.withdraw()
 root.attributes("-topmost", True)
-kwargs = {"title": "Select documentaries folder"}
+kwargs = {"title": "Select media library folder"}
 import os
 if initial and os.path.isdir(initial):
     kwargs["initialdir"] = initial

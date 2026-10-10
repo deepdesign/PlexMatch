@@ -1,6 +1,6 @@
-# PlexMatch - Documentary Renamer
+# PlexMatch - Plex Media Renamer
 
-Scans your documentary library, matches files against TMDB, and renames/restructures them into Plex-compliant naming.
+Scans a media library (movies, TV series, documentaries), matches files against TMDB, and renames/restructures them into Plex-compliant naming.
 
 ---
 
@@ -50,7 +50,7 @@ Then open http://localhost:5173 in your browser.
 
 ## How it works
 
-1. **Configure** - Enter your TMDB API key and the path to your documentaries folder (e.g. `K:\Documentaries`)
+1. **Configure** - Enter your TMDB API key and the path to your library folder (e.g. `K:\Media` or `K:\Documentaries`)
 2. **Scan** - The tool walks every subfolder, parses filenames, and matches each file against TMDB Movies and TMDB TV. Progress streams live so large libraries show a running count instead of a blank wait
 3. **Review** - A table shows every file's current name, proposed Plex name, confidence score, and TMDB link. For each row you can:
    - Approve or reject the proposed rename
@@ -67,15 +67,15 @@ Then open http://localhost:5173 in your browser.
 
 **Films** (point a *Movie* library here):
 ```
-Documentaries/
+Media/
   Movies/
     Fukushima A Nuclear Nightmare (2026) {tmdb-1234567}/
       Fukushima A Nuclear Nightmare (2026).mkv
 ```
 
-**TV documentary series** (point a *TV Show* library here):
+**TV series** (point a *TV Show* library here):
 ```
-Documentaries/
+Media/
   TV/
     Making a Murderer (2015) {tmdb-61664}/
       Season 01/
@@ -94,11 +94,11 @@ The `{tmdb-…}` folder tag is added when **Add TMDB/IMDb IDs to folder names** 
 - Every rename batch is logged to `backend/rename_log.json` so it can be undone
 - If a file has no TMDB match, it is flagged as unmatched - use the per-row manual search to correct it
 - With "Clean names without a TMDB match" enabled, unmatched files still get a best-effort Plex name built from the folder (title/year) and filename (season/episode/episode title). These rows are badged **Local** and are not auto-approved - review them before renaming
-- An optional **OMDb** key (free, IMDb-backed) is used as a fallback when TMDB has no confident match - it adds coverage for obscure docs, fills the `{imdb-...}` folder tag, and can supply episode names. Get a free key at [omdbapi.com](https://www.omdbapi.com/apikey.aspx)
+- An optional **OMDb** key (free, IMDb-backed) is used as a fallback when TMDB has no confident match - it adds coverage for obscure titles, fills the `{imdb-...}` folder tag, and can supply episode names. Get a free key at [omdbapi.com](https://www.omdbapi.com/apikey.aspx)
 - Optional **AI** (OpenAI or Anthropic): pick one provider, sign in on their site, paste an API key. Used only on weak TMDB/OMDb matches (and via per-row **Ask AI**). Results are cached. Keys stay on this machine. OpenAI-compatible **base URL** is supported for Azure / Groq / local proxies.
 - "Look up unmatched titles on Wikipedia" (no API key needed) refines those names with a canonical title, year, and episode name when a Wikipedia article exists; such rows are badged **Web** with a Wikipedia link. Titles with no Wikipedia article fall back to the **Local** filename cleanup
 - Files already in the correct Plex location are flagged **organised** (hidden by default); a file whose target name is already taken is flagged a **conflict** so the rename never silently fails
-- Rows missing a year are flagged; expand the row and use **Use as-is** to apply a typed title/year (no TMDB needed) - handy for docs not in any database, or just to add a year for better Plex matching
+- Rows missing a year are flagged; expand the row and use **Use as-is** to apply a typed title/year (no TMDB needed) - handy for titles not in any database, or just to add a year for better Plex matching
 - Confidence scores: High (85%+), Medium (60-84%), Low (below 60%)
 
 ---

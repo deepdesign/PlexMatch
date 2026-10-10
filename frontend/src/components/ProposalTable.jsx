@@ -101,7 +101,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   )
 
   // Rebuild the name locally (no TMDB) using the typed title/year. Useful for
-  // docs not in any database, or just to add a missing year for Plex matching.
+  // titles not in any database, or just to add a missing year for Plex matching.
   const applyLocal = async () => {
     setBusy(true)
     setSearchError(null)
@@ -345,7 +345,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
                     className="btn-secondary"
                     onClick={applyLocal}
                     disabled={busy}
-                    title="Build the name from your title/year without checking TMDB (good for docs not in any database, or to add a missing year)"
+                    title="Build the name from your title/year without checking TMDB (good for titles not in any database, or to add a missing year)"
                   >
                     Use as-is
                   </button>

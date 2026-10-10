@@ -285,7 +285,7 @@ export default function App() {
             <path d="M12 2v15M2 7l10 5 10-5" stroke="#F5A623" strokeWidth="1.5"/>
           </svg>
           <span className="brand-name">PlexMatch</span>
-          <span className="brand-sub">Documentary Renamer</span>
+          <span className="brand-sub">Plex Media Renamer</span>
         </div>
         <div className="pipeline">
           {STAGES.map((s, i) => (
@@ -341,7 +341,7 @@ export default function App() {
                 </svg>
               </div>
               <h2>Configure and scan your library</h2>
-              <p>Enter your TMDB API key and documentaries folder path in the panel on the left, then click <strong>Scan Library</strong>.</p>
+              <p>Enter your TMDB API key and library folder path in the panel on the left, then click <strong>Scan Library</strong>.</p>
             </div>
           )}
 

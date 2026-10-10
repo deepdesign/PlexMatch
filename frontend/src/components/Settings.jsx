@@ -58,6 +58,39 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
   }, [settings.ai_enabled, settings.ai_provider])
 
   const aiProvider = AI_PROVIDERS[settings.ai_provider]
+  const aiKey = aiProvider ? (settings[aiProvider.keyField] || "").trim() : ""
+
+  // Verify the AI key with the provider shortly after the user stops typing
+  const [keyCheck, setKeyCheck] = useState({ status: "idle", error: null })
+  useEffect(() => {
+    if (!settings.ai_enabled || !aiProvider || !aiKey) {
+      setKeyCheck({ status: "idle", error: null })
+      return
+    }
+    let cancelled = false
+    setKeyCheck({ status: "checking", error: null })
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API}/api/ai/verify-key`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: settings.ai_provider,
+            api_key: aiKey,
+            base_url: settings.openai_base_url,
+          }),
+        })
+        const data = await res.json()
+        if (cancelled) return
+        setKeyCheck(data.valid
+          ? { status: "valid", error: null }
+          : { status: "invalid", error: data.error || "Key not recognised" })
+      } catch {
+        if (!cancelled) setKeyCheck({ status: "invalid", error: "Couldn't check the key - is the backend running?" })
+      }
+    }, 600)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [settings.ai_enabled, settings.ai_provider, aiKey])
   const aiModels = aiProvider
     ? (settings.ai_model && !aiProvider.models.includes(settings.ai_model)
         ? [settings.ai_model, ...aiProvider.models]
@@ -149,7 +182,7 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
 
       <div className="settings-section">
         <h3 className="settings-heading">Library</h3>
-        <label className="field-label">Documentaries folder</label>
+        <label className="field-label">Library folder</label>
         <div className="folder-input-row">
           <input
             type="text"
@@ -233,20 +266,35 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
               <input
                 id="ai-key"
                 type="password"
-                className="field-input"
+                className={`field-input ${keyCheck.status === "invalid" ? "field-input--error" : ""}`}
                 placeholder={aiProvider.keyPlaceholder}
                 value={settings[aiProvider.keyField] || ""}
                 onChange={e => update(aiProvider.keyField, e.target.value)}
               />
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => window.open(aiProvider.keyUrl, "_blank", "noopener,noreferrer")}
-                title={`Sign in to ${aiProvider.label} and create an API key`}
-              >
-                Get key ↗
-              </button>
+              {keyCheck.status === "checking" ? (
+                <span className="key-status key-status--checking" title="Checking key…">
+                  <div className="spinner-sm" />
+                </span>
+              ) : keyCheck.status === "valid" ? (
+                <span className="key-status key-status--ok" role="img" aria-label="Key verified" title={`${aiProvider.label} key verified`}>
+                  <svg viewBox="0 0 16 16" fill="none">
+                    <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => window.open(aiProvider.keyUrl, "_blank", "noopener,noreferrer")}
+                  title={`Sign in to ${aiProvider.label} and create an API key`}
+                >
+                  Get key ↗
+                </button>
+              )}
             </div>
+            {keyCheck.status === "invalid" && (
+              <span className="field-error">{keyCheck.error}</span>
+            )}
 
             <label className="field-label" htmlFor="ai-model">Model</label>
             <select
@@ -334,7 +382,7 @@ export default function Settings({ settings, onChange, onScan, scanning, stage }
         <label className="toggle-row">
           <div className="toggle-info">
             <span className="toggle-label">Add TMDB/IMDb IDs to folder names</span>
-            <span className="toggle-sub">Append <code>{"{tmdb-…}"}</code> to folders so Plex matches exactly (recommended for obscure docs)</span>
+            <span className="toggle-sub">Append <code>{"{tmdb-…}"}</code> to folders so Plex matches exactly (recommended for obscure titles)</span>
           </div>
           <button
             role="switch"

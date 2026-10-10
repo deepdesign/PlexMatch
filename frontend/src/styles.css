@@ -295,6 +295,32 @@ select.field-input option {
   white-space: nowrap;
 }
 
+.key-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+}
+
+.key-status--ok {
+  background: var(--green-dim);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  color: var(--green);
+}
+
+.key-status--ok svg {
+  width: 16px;
+  height: 16px;
+}
+
+.key-status--checking {
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+}
+
 .ai-badge {
   display: inline-block;
   font-size: 10px;
