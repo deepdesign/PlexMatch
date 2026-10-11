@@ -52,14 +52,14 @@ def load_settings():
     return {
         "tmdb_api_key": "",
         "root_folder": "",
-        "auto_pick_top": True,
-        "restructure_folders": True,
+        "auto_pick_top": False,
+        "restructure_folders": False,
         "clean_empty_folders": False,
-        "clean_unmatched": True,
+        "clean_unmatched": False,
         "web_lookup": True,
-        "split_libraries": True,
-        "skip_output_folders": True,
-        "embed_ids": True,
+        "split_libraries": False,
+        "skip_output_folders": False,
+        "embed_ids": False,
         "omdb_api_key": "",
         "ai_enabled": False,
         "ai_provider": "",
@@ -128,7 +128,16 @@ EXX_PATTERN = re.compile(r"(?<![A-Za-z0-9])[Ee](\d{1,2})(?![A-Za-z0-9])")
 
 # Folder names that carry no useful title info, so they must never be used as a
 # search hint (e.g. a single episode inside a "Season 01" folder).
-SEASON_FOLDER_PATTERN = re.compile(r"^(season[\s._-]*\d+|specials|s\d{1,2})$", re.IGNORECASE)
+SEASON_FOLDER_PATTERN = re.compile(
+    r"^(?:(?:season|series)[\s._-]*\d+|specials|s\d{1,2})$",
+    re.IGNORECASE,
+)
+# Disk, extra, and sorting folders inside a show. They are not a separate program.
+DISK_FOLDER_PATTERN = re.compile(
+    r"^(?:(?:cd|disc|disk|dvd|part|pt)[\s._-]*\d+|extras?|bonus|featurettes?|"
+    r"samples?|subs?|subtitles|unsorted|misc|other|new|tmp|temp|rips?)$",
+    re.IGNORECASE,
+)
 
 # Library-level folder names that never describe a single title, so they must
 # not be used as a search hint for a lone video file inside them.
@@ -586,10 +595,17 @@ def find_best_match(parsed: dict, api_key: str, omdb_key: str = "") -> dict:
 
 
 def needs_manual_pick(match: dict, auto_pick: bool) -> bool:
-    """When auto-pick is off, a weak or close call should wait for Review."""
-    if auto_pick or not match.get("matched"):
+    """Auto-pick checks a match only when its confidence is over 90%.
+
+    With auto-pick off, a weak or close call still waits for review.
+    """
+    if not match.get("matched"):
         return False
     confidence = match.get("confidence") or 0
+    if auto_pick:
+        # Same rounding the review screen uses, so "91%" is checked and "90%" is not.
+        shown = int(confidence * 100 + 0.5)
+        return shown <= 90
     if confidence < 0.8:
         return True
     for alt in match.get("alternatives") or []:
@@ -894,65 +910,81 @@ def omdb_by_imdb_id(imdb_id: str, api_key: str, parsed: dict) -> dict | None:
     }
 
 
-def match_from_link(text: str, parsed: dict, api_key: str, omdb_key: str = "") -> tuple[dict | None, dict, str | None]:
-    """Turn a pasted TMDB or IMDb link into a match. Episode numbers on the file are kept."""
+def match_from_link(text: str, parsed: dict, api_key: str, omdb_key: str = "",
+                    keep_numbers: bool = False) -> tuple[dict | None, dict, str | None]:
+    """Turn a pasted TMDB or IMDb link into a match.
+
+    A link to one episode can set that file's season and episode. When
+    keep_numbers is set, the link only chooses the show; each file keeps the
+    season and episode already on it.
+    """
     ref = parse_media_link(text)
     if not ref:
         return None, parsed, "Paste a TMDB or IMDb title link."
     parsed = dict(parsed)
-    if ref.get("season"):
-        parsed["season"] = ref["season"]
-    if ref.get("episode"):
-        parsed["episode"] = ref["episode"]
+    if keep_numbers:
         parsed["is_tv"] = True
+    else:
+        if ref.get("season"):
+            parsed["season"] = ref["season"]
+        if ref.get("episode"):
+            parsed["episode"] = ref["episode"]
+            parsed["is_tv"] = True
 
     if ref["source"] == "tmdb":
+        if keep_numbers and ref["media_type"] != "tv":
+            return None, parsed, "Paste a TV series link."
         if ref["media_type"] == "tv":
             parsed["is_tv"] = True
         details = tmdb_get_details(ref["media_type"], ref["tmdb_id"], api_key)
         if not details:
             return None, parsed, "Could not load that TMDB title."
-        return build_match_from_details(details, ref["media_type"], parsed, api_key, 1.0), parsed, None
+        return build_match_from_details(
+            details, ref["media_type"], parsed, api_key, 1.0, omdb_key,
+        ), parsed, None
 
     found = tmdb_find_imdb(ref["imdb_id"], api_key) or {}
     movies = found.get("movie_results") or []
     shows = found.get("tv_results") or []
     episodes = found.get("tv_episode_results") or []
-    prefer_tv = bool(parsed.get("is_tv") or parsed.get("episode"))
+    prefer_tv = bool(keep_numbers or parsed.get("is_tv") or parsed.get("episode"))
     imdb_url = f"https://www.imdb.com/title/{ref['imdb_id']}/"
 
     if episodes and (prefer_tv or not movies):
         ep = episodes[0]
         show_id = ep.get("show_id")
-        if ep.get("season_number"):
-            parsed["season"] = ep["season_number"]
-        if ep.get("episode_number"):
-            parsed["episode"] = ep["episode_number"]
+        if not keep_numbers:
+            if ep.get("season_number"):
+                parsed["season"] = ep["season_number"]
+            if ep.get("episode_number"):
+                parsed["episode"] = ep["episode_number"]
         parsed["is_tv"] = True
         if show_id:
             details = tmdb_get_details("tv", show_id, api_key)
             if details:
-                match = build_match_from_details(details, "tv", parsed, api_key, 1.0)
+                match = build_match_from_details(details, "tv", parsed, api_key, 1.0, omdb_key)
                 match["imdb_id"] = ref["imdb_id"]
                 match["imdb_url"] = imdb_url
-                if ep.get("name"):
+                if not keep_numbers and ep.get("name"):
                     match["episode_name"] = ep["name"]
                 return match, parsed, None
 
     hit = kind = None
     if prefer_tv and shows:
         hit, kind = shows[0], "tv"
-    elif movies:
+    elif movies and not keep_numbers:
         hit, kind = movies[0], "movie"
     elif shows:
         hit, kind = shows[0], "tv"
+    if keep_numbers and kind != "tv":
+        return None, parsed, "Paste a TV series link."
     if hit:
         if kind == "tv":
             parsed["is_tv"] = True
         details = tmdb_get_details(kind, hit["id"], api_key)
         if not details:
             return None, parsed, "Could not load that title from TMDB."
-        match = build_match_from_details(details, kind, parsed, api_key, 1.0)
+        match = build_match_from_details(details, kind, parsed, api_key, 1.0, omdb_key)
         match["imdb_id"] = ref["imdb_id"]
         match["imdb_url"] = imdb_url
         return match, parsed, None
@@ -960,6 +992,8 @@ def match_from_link(text: str, parsed: dict, api_key: str, omdb_key: str = "") -
     if omdb_key:
         omdb = omdb_by_imdb_id(ref["imdb_id"], omdb_key, parsed)
         if omdb:
+            if keep_numbers and omdb.get("type") != "tv":
+                return None, parsed, "Paste a TV series link."
             return omdb, parsed, None
     return None, parsed, "No TMDB or OMDb title for that IMDb id."
 
@@ -1314,6 +1348,14 @@ def build_plex_names(match: dict, original_ext: str,
         episode = match["episode"] or 1
         ep_title = sanitise_filename(match["episode_name"]) if match["episode_name"] else ""
         season_folder = f"Season {season:02d}"
+        if match.get("folder_locked") and not match.get("season") and not match.get("episode"):
+            loose = sanitise_filename(match.get("loose_name") or "")
+            if loose and loose.lower() != title.lower():
+                filename = f"{title_year} - {loose}{original_ext}"
+            else:
+                filename = f"{title_year}{original_ext}"
+            folder = os.path.join(TV_DIR, show_folder) if split else show_folder
+            return {"folder": folder, "filename": filename}
         if ep_title:
             filename = f"{title_year} - S{season:02d}E{episode:02d} - {ep_title}{original_ext}"
         else:
@@ -1398,8 +1440,7 @@ def scan_directory(root: str, skip_output: bool = False) -> list:
             folder_name = Path(dirpath).name
             use_folder_as_hint = (
                 len(video_files) == 1
-                and folder_name.lower() not in GENERIC_LIBRARY_FOLDERS | {os.path.basename(root).lower()}
-                and not SEASON_FOLDER_PATTERN.match(folder_name.strip())
+                and not is_structural_folder(folder_name, os.path.basename(root))
             )
 
             parse_hint = folder_name if use_folder_as_hint else Path(vf).stem
@@ -1425,6 +1466,7 @@ def scan_directory(root: str, skip_output: bool = False) -> list:
             for item in items:
                 item["group_tv"] = True
 
+    assign_show_folders(results, root)
     return results
 
 
@@ -1443,19 +1485,127 @@ def proposal_status(proposed_full_path: str, current_full_path: str, default: st
     return default
 
 
+def _norm_title(title: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+
+
+def _titles_agree(folder_title: str | None, file_title: str | None) -> bool:
+    """True when a filename is already naming the same program as its folder."""
+    folder = _norm_title(folder_title)
+    file_title = _norm_title(file_title)
+    if not folder or not file_title:
+        return False
+    if len(folder) < 3 or len(file_title) < 3:
+        return folder == file_title
+    return folder == file_title or file_title.startswith(folder + " ") or folder.startswith(file_title + " ")
+
+
+def is_structural_folder(name: str, root_name: str = "") -> bool:
+    """Season, disk, and library folders. They do not name a program."""
+    stripped = (name or "").strip()
+    low = stripped.lower()
+    if not low or low in GENERIC_LIBRARY_FOLDERS or (root_name and low == root_name.lower()):
+        return True
+    if SEASON_FOLDER_PATTERN.match(stripped) or DISK_FOLDER_PATTERN.match(stripped):
+        return True
+    return False
+
+
+def _folder_parts(folder: str | None) -> list[str]:
+    if not folder or folder in (".", ""):
+        return []
+    return [part for part in str(folder).replace("\\", "/").split("/") if part and part != "."]
+
+
+def assign_show_folders(items: list, root: str) -> None:
+    """Mark every video under a program folder with that program.
+
+    A folder like "The Simpsons" owns the files inside it and inside its
+    season, disk, and other subfolders. A file with a messy name is matched
+    as that show instead of being split into its own folder.
+    """
+    root_name = os.path.basename(os.path.abspath(root))
+    records = []
+    for item in items:
+        parts = _folder_parts(item.get("folder"))
+        file_parsed = parse_filename(Path(item.get("filename") or "").stem)
+        records.append((item, parts, file_parsed))
+
+    files_under = defaultdict(list)
+    children = defaultdict(set)
+    for _item, parts, file_parsed in records:
+        for depth in range(len(parts) + 1):
+            files_under[tuple(parts[:depth])].append(file_parsed)
+        for depth, name in enumerate(parts):
+            children[tuple(parts[:depth])].add(name)
+
+    def titled(path: tuple) -> dict | None:
+        if not path:
+            return None
+        name = path[-1]
+        if is_structural_folder(name, root_name):
+            return None
+        parsed = parse_filename(name)
+        if not (parsed.get("title") or "").strip():
+            return None
+        return parsed
+
+    def has_season_child(path: tuple) -> bool:
+        return any(SEASON_FOLDER_PATTERN.match(child.strip()) for child in children[path])
+
+    def has_episode(path: tuple) -> bool:
+        return any(parsed.get("is_tv") or parsed.get("episode") for parsed in files_under[path])
+
+    info = {}
+    for path in files_under:
+        parsed = titled(path)
+        if not parsed:
+            info[path] = None
+            continue
+        agreed = any(_titles_agree(parsed["title"], file_parsed.get("title")) for file_parsed in files_under[path])
+        seasons = has_season_child(path)
+        info[path] = {
+            "title": parsed["title"],
+            "year": parsed.get("year"),
+            "strong": seasons or agreed,
+            "weak": has_episode(path),
+            "is_tv": seasons or has_episode(path),
+        }
+
+    for item, parts, file_parsed in records:
+        strong_hit = None
+        weak_hit = None
+        for depth in range(len(parts), 0, -1):
+            meta = info.get(tuple(parts[:depth]))
+            if not meta:
+                continue
+            if meta["strong"]:
+                strong_hit = meta
+                break
+            if meta["weak"]:
+                weak_hit = meta
+        chosen = strong_hit or weak_hit
+        if not chosen:
+            continue
+        item["show_folder"] = {
+            "title": chosen["title"],
+            "year": chosen["year"],
+            "is_tv": chosen["is_tv"],
+        }
+        if chosen["is_tv"]:
+            item["group_tv"] = True
+
+
 def series_folder_name(full_path: str, root: str) -> str | None:
-    """The title-bearing folder for a file (its parent, or grandparent if the
-    parent is a 'Season NN' folder). None for files sitting directly in root."""
-    parent = os.path.dirname(full_path)
-    if os.path.abspath(parent) == os.path.abspath(root):
-        return None
-    name = os.path.basename(parent)
-    if SEASON_FOLDER_PATTERN.match(name.strip()):
-        grand = os.path.dirname(parent)
-        if os.path.abspath(grand) != os.path.abspath(root):
-            return os.path.basename(grand)
-        return None
-    return name
+    """The nearest folder that names a program, skipping season and disk folders."""
+    root_name = os.path.basename(os.path.abspath(root))
+    directory = os.path.dirname(full_path)
+    while os.path.abspath(directory) != os.path.abspath(root):
+        name = os.path.basename(directory)
+        if not is_structural_folder(name, root_name):
+            return name
+        directory = os.path.dirname(directory)
+    return None
 
 
 def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
@@ -1497,6 +1647,13 @@ def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
         return None
     year = folder_parsed["year"] or file_parsed["year"]
     is_tv = bool(season and episode)
+    show = f.get("show_folder") or {}
+    if show.get("title"):
+        title = show["title"]
+        if show.get("year"):
+            year = show["year"]
+        if show.get("is_tv"):
+            is_tv = True
 
     # Drop a redundant series-name prefix from the episode title
     if episode_title and episode_title.lower().startswith(title.lower()):
@@ -1713,7 +1870,17 @@ def build_proposal(f: dict, root: str, api_key: str,
         parsed["is_tv"] = True
     if not parsed.get("episode_title") and file_parsed.get("episode_title"):
         parsed["episode_title"] = file_parsed["episode_title"]
-    if f.get("group_tv"):
+    show = f.get("show_folder") or {}
+    if show.get("title"):
+        agreed = _titles_agree(show["title"], parsed.get("title"))
+        parsed["title"] = show["title"]
+        if show.get("year"):
+            parsed["year"] = show["year"]
+        elif not agreed:
+            parsed["year"] = None
+        if show.get("is_tv") or f.get("group_tv"):
+            parsed["is_tv"] = True
+    elif f.get("group_tv"):
         parsed["is_tv"] = True
     if not parsed["title"]:
         if do_cleanup:
@@ -1767,6 +1934,9 @@ def build_proposal(f: dict, root: str, api_key: str,
 
     if match.get("type") == "tv" or parsed.get("is_tv"):
         match["episode_name"] = choose_episode_name(match.get("episode_name"), parsed.get("episode_title"))
+    if show.get("is_tv") and not parsed.get("season") and not parsed.get("episode"):
+        match["folder_locked"] = True
+        match["loose_name"] = file_parsed.get("title") or Path(f.get("filename") or "").stem
 
     plex_names = apply_layout(
         build_plex_names(match, f["ext"], split, embed_ids),
@@ -2108,11 +2278,11 @@ def scan():
         return jsonify({"error": "TMDB API key is required"}), 400
 
     clean_unmatched = bool(data.get("clean_unmatched", False))
-    web_lookup = bool(data.get("web_lookup", False))
+    web_lookup = bool(data.get("web_lookup", True))
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
-    restructure = bool(data.get("restructure_folders", True))
-    auto_pick = bool(data.get("auto_pick_top", True))
+    restructure = bool(data.get("restructure_folders", False))
+    auto_pick = bool(data.get("auto_pick_top", False))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     skip_output = bool(data.get("skip_output_folders", False))
@@ -2149,11 +2319,11 @@ def scan_stream():
         return jsonify({"error": "TMDB API key is required"}), 400
 
     clean_unmatched = bool(data.get("clean_unmatched", False))
-    web_lookup = bool(data.get("web_lookup", False))
+    web_lookup = bool(data.get("web_lookup", True))
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
-    restructure = bool(data.get("restructure_folders", True))
-    auto_pick = bool(data.get("auto_pick_top", True))
+    restructure = bool(data.get("restructure_folders", False))
+    auto_pick = bool(data.get("auto_pick_top", False))
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     skip_output = bool(data.get("skip_output_folders", False))
@@ -2218,7 +2388,7 @@ def rematch():
     parsed = data.get("parsed") or {}
     split = bool(data.get("split_libraries", False))
     embed_ids = bool(data.get("embed_ids", False))
-    restructure = bool(data.get("restructure_folders", True))
+    restructure = bool(data.get("restructure_folders", False))
 
     tmdb_id = data.get("tmdb_id")
     media_type = data.get("media_type")
@@ -2321,6 +2491,7 @@ def rematch():
             return jsonify({"error": "TMDB API key is required"}), 400
         match, parsed, link_error = match_from_link(
             data.get("link"), parsed, api_key, (data.get("omdb_api_key") or "").strip(),
+            keep_numbers=bool(data.get("series")),
         )
         if link_error:
             return jsonify({"error": link_error}), 400

@@ -448,6 +448,52 @@ function groupRows(list) {
   ))
 }
 
+const SEASON_DIR = /^(season[\s._-]*\d+|series[\s._-]*\d+|specials|s\d{1,2})$/i
+
+function seriesKey(p) {
+  const isTv = p.type === "tv" || p.parsed?.is_tv || p.season != null || p.parsed?.season != null
+  if (!isTv) return null
+  const parts = String(p.folder || "").replace(/\\/g, "/").split("/").filter(Boolean)
+  while (parts.length && SEASON_DIR.test(parts[parts.length - 1])) parts.pop()
+  if (parts.length) return `folder:${parts.join("/").toLowerCase()}`
+  const title = (p.matched_title || p.parsed?.title || "").trim().toLowerCase()
+  if (!title) return null
+  return `title:${title}`
+}
+
+function seriesLabel(proposal) {
+  const title = proposal.matched_title || proposal.parsed?.title
+  const year = proposal.matched_year || proposal.parsed?.year
+  if (title) return `${title}${year ? ` (${year})` : ""}`
+  const parts = String(proposal.folder || "").replace(/\\/g, "/").split("/").filter(Boolean)
+  while (parts.length && SEASON_DIR.test(parts[parts.length - 1])) parts.pop()
+  return parts[parts.length - 1] || "TV series"
+}
+
+function groupSeries(rows) {
+  const blocks = []
+  const at = new Map()
+  for (const row of rows) {
+    const sample = row.kind === "season" ? row.items[0].proposal : row.proposal
+    const key = seriesKey(sample)
+    if (!key) {
+      blocks.push(row)
+      continue
+    }
+    let block = at.get(key)
+    if (!block) {
+      block = { kind: "series", key, rows: [], count: 0 }
+      at.set(key, block)
+      blocks.push(block)
+    }
+    block.rows.push(row)
+    block.count += row.kind === "season" ? row.items.length : 1
+  }
+  return blocks.flatMap(block => (
+    block.kind === "series" && block.count < 2 ? block.rows : [block]
+  ))
+}
+
 const APPROVABLE_ROW = new Set(["pending", "cleanup"])
 
 function SeasonGroup({ group, rowProps, onSetApproved }) {
@@ -526,6 +572,133 @@ function SeasonGroup({ group, rowProps, onSetApproved }) {
   )
 }
 
+async function rematchFile(proposal, payload, { root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }) {
+  const res = await fetch(`${API}/api/rematch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      root_folder: root,
+      tmdb_api_key: apiKey,
+      full_path: proposal.full_path,
+      rel_path: proposal.rel_path,
+      filename: proposal.filename,
+      folder: proposal.folder,
+      ext: proposal.ext,
+      parsed: proposal.parsed,
+      split_libraries: split,
+      embed_ids: embedIds,
+      restructure_folders: restructure,
+      omdb_api_key: omdbKey,
+      ...aiSettings,
+      matched_title: proposal.matched_title,
+      confidence: proposal.confidence,
+      alternatives: proposal.alternatives,
+      ...payload,
+    }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || "Search failed")
+  return data
+}
+
+function SeriesBlock({ block, proposals, onChange, rowProps, onSetApproved }) {
+  const [linkUrl, setLinkUrl] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const members = proposals.filter(p => seriesKey(p) === block.key)
+  const first = members[0] || (block.rows[0].kind === "season" ? block.rows[0].items[0].proposal : block.rows[0].proposal)
+  const label = seriesLabel(first)
+
+  const apply = async () => {
+    const link = linkUrl.trim()
+    if (!link || busy) return
+    setBusy(true)
+    setError(null)
+    const updates = new Map()
+    let failed = 0
+    let message = ""
+    const queue = [...members]
+    const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
+      while (queue.length) {
+        const proposal = queue.shift()
+        try {
+          const data = await rematchFile(proposal, { link, series: true }, rowProps)
+          if (!data.matched) {
+            failed += 1
+            message = data.message || "No TMDB match found."
+            continue
+          }
+          updates.set(proposal.full_path, data)
+        } catch (e) {
+          failed += 1
+          message = e.message
+        }
+      }
+    })
+    await Promise.all(workers)
+    if (updates.size) {
+      onChange(proposals.map(p => (
+        updates.has(p.full_path) ? { ...p, ...updates.get(p.full_path), approved: true } : p
+      )))
+    }
+    setError(failed ? message : null)
+    setBusy(false)
+  }
+
+  return (
+    <>
+      <tr className="series-row">
+        <td className="col-approve" />
+        <td className="col-original">
+          <span className="series-label">{label}</span>
+          <span className="season-count">{members.length} episodes</span>
+        </td>
+        <td className="col-arrow" />
+        <td className="col-proposed" colSpan={3}>
+          <div className="series-link">
+            <input
+              className="search-input"
+              placeholder="TMDB or IMDb series link"
+              value={linkUrl}
+              onChange={e => setLinkUrl(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") apply() }}
+              disabled={busy}
+            />
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={apply}
+              disabled={busy || !linkUrl.trim()}
+              title="Set this show for every episode. Each file keeps its own season and episode number."
+            >
+              {busy ? "Matching..." : "Use for series"}
+            </button>
+            {error && <span className="series-link-error">{error}</span>}
+          </div>
+        </td>
+        <td className="col-expand" />
+      </tr>
+      {block.rows.map(row => (
+        row.kind === "season" ? (
+          <SeasonGroup
+            key={row.key}
+            group={row}
+            rowProps={rowProps}
+            onSetApproved={onSetApproved}
+          />
+        ) : (
+          <ProposalRow
+            key={row.proposal.full_path}
+            proposal={row.proposal}
+            index={row.index}
+            {...rowProps}
+          />
+        )
+      ))}
+    </>
+  )
+}
+
 export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }) {
   const [filter, setFilter] = useState(() => (proposals.some(needsAttention) ? "attention" : "all"))
   const [search, setSearch] = useState("")
@@ -580,7 +753,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
     )))
   }
 
-  const grouped = groupRows(filtered)
+  const grouped = groupSeries(groupRows(filtered))
   const attentionCount = proposals.filter(needsAttention).length
   const includedCount = proposals.filter(p => p.approved && APPROVABLE_ROW.has(p.status)).length
   const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, proposals }
@@ -652,7 +825,16 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
           </thead>
           <tbody>
             {grouped.map(row => (
-              row.kind === "season" ? (
+              row.kind === "series" ? (
+                <SeriesBlock
+                  key={row.key}
+                  block={row}
+                  proposals={proposals}
+                  onChange={onChange}
+                  rowProps={rowProps}
+                  onSetApproved={setPathsApproved}
+                />
+              ) : row.kind === "season" ? (
                 <SeasonGroup
                   key={row.key}
                   group={row}

@@ -1038,6 +1038,33 @@ button.settings-warn:hover {
   border-bottom: 1px solid var(--border);
 }
 
+.series-row td {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border-2);
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.series-label {
+  font-weight: 600;
+  margin-right: 10px;
+}
+
+.series-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.series-link .search-input { flex: 1; min-width: 0; }
+
+.series-link-error {
+  color: var(--red);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .season-toggle {
   display: inline-flex;
   align-items: center;

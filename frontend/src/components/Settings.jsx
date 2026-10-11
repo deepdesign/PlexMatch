@@ -256,7 +256,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
   ].filter(Boolean).join(" · ")
   const docsSummary = [
     settings.split_libraries ? "Movies and TV subfolders" : "Don't separate",
-    settings.skip_output_folders !== false ? "Skip Movies/TV" : null,
+    settings.skip_output_folders ? "Skip Movies/TV" : null,
   ].filter(Boolean).join(" · ")
 
   const keyBadges = (
@@ -340,8 +340,8 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
           summary={<span className="setup-summary">{matchSummary}</span>}
         >
           <Toggle
-            label="Auto-pick top match"
-            sub="On approves the top match. Off leaves a weak or close call unchecked so you can confirm it"
+            label="Auto-pick matches over 90%"
+            sub="On checks a match only when confidence is over 90%. Off leaves a weak or close call unchecked so you can confirm it"
             checked={settings.auto_pick_top}
             onClick={() => update("auto_pick_top", !settings.auto_pick_top)}
           />
@@ -433,8 +433,8 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
           <Toggle
             label="Skip Movies and TV subfolders"
             sub="Leave finished files in those subfolders out of the next scan. Episodes with no title are still checked."
-            checked={settings.skip_output_folders !== false}
-            onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
+            checked={!!settings.skip_output_folders}
+            onClick={() => update("skip_output_folders", !settings.skip_output_folders)}
           />
         </Accordion>
 
