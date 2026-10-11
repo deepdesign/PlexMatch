@@ -1475,6 +1475,7 @@ button.settings-warn:hover {
 }
 
 .manual-search .manual-title { flex: 1; font-family: var(--font-mono); }
+.manual-search .manual-link { flex: 1; min-width: 0; }
 .manual-search .manual-year { width: 72px; font-family: var(--font-mono); }
 .manual-search .btn-primary { padding: 6px 14px; }
 
@@ -1893,6 +1894,72 @@ button.settings-warn:hover {
   white-space: nowrap;
 }
 .orphan-meta { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+
+.junk-modal { max-width: 760px; }
+.junk-modal .orphan-body { min-height: 0; }
+
+.junk-groups { display: flex; flex-direction: column; gap: 10px; }
+
+.junk-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.junk-group.keep { border-color: rgba(74, 222, 128, 0.35); }
+
+.junk-group-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.junk-group-head input { accent-color: var(--red); margin-top: 3px; cursor: pointer; }
+.junk-group.keep .junk-group-head input { accent-color: var(--green); }
+
+.junk-group-title { font-size: 13px; font-weight: 600; }
+.junk-group-detail {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.junk-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.junk-badge.keep { color: var(--green); }
+.junk-count { color: var(--text-3); }
+
+.junk-files {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.junk-file {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.junk-file:hover { background: var(--surface); }
+.junk-file input { accent-color: var(--red); cursor: pointer; }
+.junk-group.keep .junk-file input { accent-color: var(--green); }
 
 .modal-footer {
   display: flex;

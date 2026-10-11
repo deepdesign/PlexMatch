@@ -251,8 +251,8 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
   ].filter(Boolean).join(" · ")
   const outputSummary = [
     settings.restructure_folders ? "Plex folders" : "Rename in place",
-    settings.split_libraries && settings.restructure_folders ? "Movies/TV split" : null,
-    settings.skip_output_folders !== false ? "Skip Movies/TV" : null,
+    settings.split_libraries && settings.restructure_folders ? "Docs into Movies/TV" : null,
+    settings.skip_output_folders !== false ? "Skip docs in Movies/TV" : null,
     settings.embed_ids && settings.restructure_folders ? "IDs" : null,
   ].filter(Boolean).join(" · ")
 
@@ -396,17 +396,17 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             onClick={() => update("restructure_folders", !settings.restructure_folders)}
           />
           <Toggle
-            label="Separate Movies and TV Shows"
+            label="Separate Documentaries into movies and TV subfolders"
             sub={settings.restructure_folders
-              ? <>Put films in <code>Movies/</code> and series in <code>TV/</code> so each can be its own Plex library</>
+              ? <>One-off documentaries go in <code>Movies/</code>. Documentary series go in <code>TV/</code>.</>
               : "Only applies when files move into Plex folders."}
             checked={settings.split_libraries}
             disabled={!settings.restructure_folders}
             onClick={() => update("split_libraries", !settings.split_libraries)}
           />
           <Toggle
-            label="Skip Movies and TV folders"
-            sub="Leave the Movies and TV folders this app already filled out of the next scan."
+            label="Skip Documentaries already in movies and TV subfolders"
+            sub="Leave those subfolders out of the next scan."
             checked={settings.skip_output_folders !== false}
             onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
           />
@@ -472,7 +472,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
                   type="button"
                   className="btn-secondary btn-cleanup"
                   onClick={() => setCleaningJunk(true)}
-                  title="Find readmes, shortcuts and release leftovers"
+                  title="Choose readmes, release files, NFO and picture subtitles to delete"
                 >
                   <svg viewBox="0 0 16 16" fill="none">
                     <path d="M4 2.5h5l3 3V13.5H4v-11z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
@@ -480,7 +480,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
                   </svg>
                   Clean up junk files
                 </button>
-                <span className="toggle-sub">Readmes, shortcuts and release leftovers. Posters, subtitles and .nfo stay.</span>
+                <span className="toggle-sub">Readmes and release files start selected. NFO and picture subtitles stay unless you include them.</span>
               </div>
             </div>
           ) : (

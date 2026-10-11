@@ -26,6 +26,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   const [expanded, setExpanded] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
   const [manualYear, setManualYear] = useState("")
+  const [linkUrl, setLinkUrl] = useState("")
   const [busy, setBusy] = useState(false)
   const [searchError, setSearchError] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -94,6 +95,11 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   const manualSearch = () => {
     if (!manualTitle.trim()) return
     rematch({ manual_title: manualTitle.trim(), manual_year: manualYear.trim() })
+  }
+
+  const applyLink = () => {
+    if (!linkUrl.trim()) return
+    rematch({ link: linkUrl.trim() })
   }
 
   const askAi = () => rematch({
@@ -332,7 +338,24 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
               )}
 
               <div className="manual-search">
-                <span className="alt-heading">Search manually, or use as-is</span>
+                <span className="alt-heading">Paste a link, search, or use as-is</span>
+                <div className="manual-search-row">
+                  <input
+                    className="search-input manual-link"
+                    placeholder="TMDB or IMDb link"
+                    value={linkUrl}
+                    onChange={e => setLinkUrl(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") applyLink() }}
+                  />
+                  <button
+                    className="btn-secondary"
+                    onClick={applyLink}
+                    disabled={busy || !linkUrl.trim()}
+                    title="Use this TMDB movie, TMDB series, or IMDb title"
+                  >
+                    Use link
+                  </button>
+                </div>
                 <div className="manual-search-row">
                   <input
                     className="search-input manual-title"
@@ -387,6 +410,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
 function needsAttention(p) {
   if (p.status === "conflict" || p.status === "unmatched" || p.status === "error") return true
   if (p.missing_year || p.needs_choice) return true
+  if (p.status === "cleanup" && (p.episode || p.season)) return true
   return p.confidence > 0 && p.confidence < 0.6 && p.status !== "organised"
 }
 
@@ -567,7 +591,7 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
     ["attention", attentionCount ? `Needs attention (${attentionCount})` : "Needs attention"],
   ]
   const hint = filter === "attention"
-    ? "Missing year, name clash, or weak match."
+    ? "Missing year, name clash, weak match, or an episode tidy-up."
     : filter === "rename"
     ? "These files will be renamed."
     : filter === "matched"

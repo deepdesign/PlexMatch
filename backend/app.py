@@ -117,11 +117,14 @@ YEAR_RANGE_PATTERN = re.compile(
     r"\b(19[5-9]\d|20[0-3]\d)\s*[-–—]\s*(19[5-9]\d|20[0-3]\d)\b"
 )
 
-# Episode markers, in priority order. SxxExx is most explicit; "N of M" and
-# "Part N" / "Episode N" are common in documentary rips (e.g. "2of7").
-SXXEXX_PATTERN = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,2})")
+# Episode markers, in priority order. SxxExx is most explicit; "N of M",
+# "Part N" / "Episode N", and a bare "E02" are common in documentary rips.
+SXXEXX_PATTERN = re.compile(r"[Ss](\d{1,2})[\s._-]*[Ee](\d{1,2})")
 NOFM_PATTERN = re.compile(r"\b(\d{1,2})\s*of\s*(\d{1,2})\b", re.IGNORECASE)
 PART_PATTERN = re.compile(r"\b(?:part|pt|episode|ep)\s*\.?\s*(\d{1,2})\b", re.IGNORECASE)
+# "Show-E02-Title" has no season. The E must be its own token so "S01E02" is
+# left to the pattern above and words like "Episode" are left to PART_PATTERN.
+EXX_PATTERN = re.compile(r"(?<![A-Za-z0-9])[Ee](\d{1,2})(?![A-Za-z0-9])")
 
 # Folder names that carry no useful title info, so they must never be used as a
 # search hint (e.g. a single episode inside a "Season 01" folder).
@@ -173,6 +176,9 @@ def find_episode_marker(name: str):
     m = PART_PATTERN.search(name)
     if m:
         return 1, int(m.group(1)), m.start(), m.end()
+    m = EXX_PATTERN.search(name)
+    if m:
+        return 1, int(m.group(1)), m.start(), m.end()
     return None
 
 
@@ -217,24 +223,10 @@ def parse_filename(raw: str) -> dict:
     season = episode = None
     is_tv = False
     marker_start = None
-
-    m = SXXEXX_PATTERN.search(name)
-    if m:
-        season, episode = int(m.group(1)), int(m.group(2))
+    marker = find_episode_marker(name)
+    if marker:
+        season, episode, marker_start, _marker_end = marker
         is_tv = True
-        marker_start = m.start()
-    else:
-        m = NOFM_PATTERN.search(name)  # e.g. "2of7", "2 of 7"
-        if m:
-            season, episode = 1, int(m.group(1))
-            is_tv = True
-            marker_start = m.start()
-        else:
-            m = PART_PATTERN.search(name)  # e.g. "Part 2", "Episode 2"
-            if m:
-                season, episode = 1, int(m.group(1))
-                is_tv = True
-                marker_start = m.start()
 
     # Everything from the episode marker onward is series-noise / episode title;
     # the canonical episode name comes from TMDB.
@@ -691,6 +683,156 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
         "source": "omdb",
         "imdb_url": f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else None,
     }
+
+
+_IMDB_ID = re.compile(r"\b(tt\d{5,})\b", re.IGNORECASE)
+_TMDB_URL = re.compile(r"themoviedb\.org/(movie|tv)/(\d+)", re.IGNORECASE)
+_TMDB_SEASON = re.compile(r"/season/(\d+)", re.IGNORECASE)
+_TMDB_EPISODE = re.compile(r"/episode/(\d+)", re.IGNORECASE)
+
+
+def parse_media_link(text: str) -> dict | None:
+    """A TMDB movie/tv URL, or any text that contains an IMDb title id."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    tmdb = _TMDB_URL.search(text)
+    if tmdb:
+        ref = {
+            "source": "tmdb",
+            "media_type": "tv" if tmdb.group(1).lower() == "tv" else "movie",
+            "tmdb_id": int(tmdb.group(2)),
+        }
+        season = _TMDB_SEASON.search(text)
+        episode = _TMDB_EPISODE.search(text)
+        if season:
+            ref["season"] = int(season.group(1))
+        if episode:
+            ref["episode"] = int(episode.group(1))
+        return ref
+    imdb = _IMDB_ID.search(text)
+    if imdb:
+        return {"source": "imdb", "imdb_id": imdb.group(1).lower()}
+    return None
+
+
+def tmdb_find_imdb(imdb_id: str, api_key: str) -> dict | None:
+    """TMDB's cross-reference for an IMDb id. IMDb itself has no public API."""
+    try:
+        r = requests.get(
+            f"{TMDB_BASE}/find/{imdb_id}",
+            params={"api_key": api_key, "external_source": "imdb_id"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+
+def omdb_by_imdb_id(imdb_id: str, api_key: str, parsed: dict) -> dict | None:
+    """A title the user picked by IMDb id. Confidence is 1 because they chose it."""
+    try:
+        r = requests.get(OMDB_BASE, params={"apikey": api_key, "i": imdb_id}, timeout=10)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if data.get("Response") != "True":
+        return None
+    if (data.get("Type") or "").lower() == "episode":
+        return None
+    media_type = "tv" if (data.get("Type") or "").lower() == "series" else "movie"
+    year = (data.get("Year") or "")[:4]
+    episode_name = None
+    if media_type == "tv" and parsed.get("season") and parsed.get("episode"):
+        episode_name = omdb_episode_title(imdb_id, parsed["season"], parsed["episode"], api_key)
+    return {
+        "matched": True,
+        "confidence": 1,
+        "type": media_type,
+        "tmdb_id": None,
+        "imdb_id": data.get("imdbID") or imdb_id,
+        "matched_title": data.get("Title") or "",
+        "matched_year": year if year.isdigit() else "",
+        "episode_name": episode_name,
+        "season": parsed.get("season"),
+        "episode": parsed.get("episode"),
+        "source": "omdb",
+        "imdb_url": f"https://www.imdb.com/title/{imdb_id}/",
+    }
+
+
+def match_from_link(text: str, parsed: dict, api_key: str, omdb_key: str = "") -> tuple[dict | None, dict, str | None]:
+    """Turn a pasted TMDB or IMDb link into a match. Episode numbers on the file are kept."""
+    ref = parse_media_link(text)
+    if not ref:
+        return None, parsed, "Paste a TMDB or IMDb title link."
+    parsed = dict(parsed)
+    if ref.get("season"):
+        parsed["season"] = ref["season"]
+    if ref.get("episode"):
+        parsed["episode"] = ref["episode"]
+        parsed["is_tv"] = True
+
+    if ref["source"] == "tmdb":
+        if ref["media_type"] == "tv":
+            parsed["is_tv"] = True
+        details = tmdb_get_details(ref["media_type"], ref["tmdb_id"], api_key)
+        if not details:
+            return None, parsed, "Could not load that TMDB title."
+        return build_match_from_details(details, ref["media_type"], parsed, api_key, 1.0), parsed, None
+
+    found = tmdb_find_imdb(ref["imdb_id"], api_key) or {}
+    movies = found.get("movie_results") or []
+    shows = found.get("tv_results") or []
+    episodes = found.get("tv_episode_results") or []
+    prefer_tv = bool(parsed.get("is_tv") or parsed.get("episode"))
+    imdb_url = f"https://www.imdb.com/title/{ref['imdb_id']}/"
+
+    if episodes and (prefer_tv or not movies):
+        ep = episodes[0]
+        show_id = ep.get("show_id")
+        if ep.get("season_number"):
+            parsed["season"] = ep["season_number"]
+        if ep.get("episode_number"):
+            parsed["episode"] = ep["episode_number"]
+        parsed["is_tv"] = True
+        if show_id:
+            details = tmdb_get_details("tv", show_id, api_key)
+            if details:
+                match = build_match_from_details(details, "tv", parsed, api_key, 1.0)
+                match["imdb_id"] = ref["imdb_id"]
+                match["imdb_url"] = imdb_url
+                if ep.get("name"):
+                    match["episode_name"] = ep["name"]
+                return match, parsed, None
+
+    hit = kind = None
+    if prefer_tv and shows:
+        hit, kind = shows[0], "tv"
+    elif movies:
+        hit, kind = movies[0], "movie"
+    elif shows:
+        hit, kind = shows[0], "tv"
+    if hit:
+        if kind == "tv":
+            parsed["is_tv"] = True
+        details = tmdb_get_details(kind, hit["id"], api_key)
+        if not details:
+            return None, parsed, "Could not load that title from TMDB."
+        match = build_match_from_details(details, kind, parsed, api_key, 1.0)
+        match["imdb_id"] = ref["imdb_id"]
+        match["imdb_url"] = imdb_url
+        return match, parsed, None
+
+    if omdb_key:
+        omdb = omdb_by_imdb_id(ref["imdb_id"], omdb_key, parsed)
+        if omdb:
+            return omdb, parsed, None
+    return None, parsed, "No TMDB or OMDb title for that IMDb id."
 
 
 # ---------------------------------------------------------------------------
@@ -1429,6 +1571,12 @@ def build_proposal(f: dict, root: str, api_key: str,
     ai_cfg = ai_cfg or {"enabled": False}
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
+    # A single file in a titled folder is parsed from the folder, which drops
+    # "E02" from the filename. Keep that episode number for the TV search.
+    file_marker = find_episode_marker(Path(f.get("filename") or "").stem)
+    if file_marker and parsed.get("episode") is None:
+        parsed["season"], parsed["episode"] = file_marker[0], file_marker[1]
+        parsed["is_tv"] = True
     if f.get("group_tv"):
         parsed["is_tv"] = True
     if not parsed["title"]:
@@ -1608,8 +1756,9 @@ def find_orphan_folders(root: str) -> list:
     return orphans
 
 
-# Files a release folder often ships that Plex never uses. Subtitles, artwork
-# and .nfo stay, because Plex and the renamer treat those as part of the title.
+# Files a release folder often ships that Plex never uses.
+# Text subtitles and posters are never offered. .nfo and VobSub (.idx + .sub)
+# are listed so the user can choose, but they start unchecked.
 JUNK_EXTENSIONS = {
     ".txt", ".text", ".md", ".markdown", ".rtf", ".html", ".htm",
     ".url", ".lnk", ".webloc", ".website",
@@ -1624,36 +1773,86 @@ JUNK_NAMES = {
     "thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store",
     "readme", "read.me",
 }
+# Never deletable from this tool: text subs and artwork stay with the video.
+KEEP_EXTENSIONS = {
+    ".srt", ".ass", ".ssa", ".sup", ".vtt",
+    ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+}
 _README_EXT = {".txt", ".text", ".md", ".markdown", ".rtf", ".diz", ".html", ".htm", ".pdf", ".doc", ".docx"}
 _LINK_EXT = {".url", ".lnk", ".webloc", ".website"}
 _RELEASE_EXT = {".sfv", ".md5", ".sha", ".sha1", ".sha256", ".par2", ".torrent", ".nzb", ".srr", ".cue"}
 
+JUNK_CATALOG = [
+    {
+        "id": "readme",
+        "label": "Readme",
+        "detail": "Notes or instructions that came with the download. Plex does not read them, so they are safe to delete.",
+        "default_selected": True,
+    },
+    {
+        "id": "shortcut",
+        "label": "Shortcut",
+        "detail": "A link to a website or another file, not the video. Safe to delete.",
+        "default_selected": True,
+    },
+    {
+        "id": "release",
+        "label": "Release file",
+        "detail": "Checksums, torrent files and repair data from the download. Plex does not use them, so they are safe to delete.",
+        "default_selected": True,
+    },
+    {
+        "id": "other",
+        "label": "Other leftover",
+        "detail": "Logs, playlists, Windows clutter and programs shipped with the download. They are not used for playback. A program is safer deleted than opened.",
+        "default_selected": True,
+    },
+    {
+        "id": "nfo",
+        "label": "NFO",
+        "detail": "Usually a scene release note. A file named after the video can hold Kodi metadata. Plex ignores it. Leave it if another app reads it.",
+        "default_selected": False,
+    },
+    {
+        "id": "vobsub",
+        "label": "Picture subtitle",
+        "detail": ".idx is the timing and .sub is the pictures. Plex can show that pair. Leave both unless you already have a text subtitle (.srt). Checking one also checks its pair.",
+        "default_selected": False,
+    },
+]
+JUNK_BY_ID = {item["id"]: item for item in JUNK_CATALOG}
+
 
 def junk_kind(filename: str) -> str | None:
-    """Why this file is junk, or None if it should be kept."""
+    """Category id for a file this tool may delete, or None if it must be kept."""
     lower = filename.lower()
     suffix = Path(filename).suffix.lower()
-    if suffix in VIDEO_EXTENSIONS or suffix in SIDECAR_EXTENSIONS:
+    if suffix in VIDEO_EXTENSIONS or suffix in KEEP_EXTENSIONS:
         return None
+    if suffix in {".idx", ".sub"}:
+        return "vobsub"
+    if suffix == ".nfo":
+        return "nfo"
     if lower not in JUNK_NAMES and suffix not in JUNK_EXTENSIONS:
         return None
     if suffix in _LINK_EXT:
-        return "Shortcut"
+        return "shortcut"
     if suffix in _README_EXT or lower.startswith("readme") or lower == "read.me":
-        return "Readme"
+        return "readme"
     if suffix in _RELEASE_EXT:
-        return "Release file"
-    return "Junk file"
+        return "release"
+    return "other"
 
 
 def find_junk_files(root: str) -> list:
-    """Readmes, shortcuts and other non-media files under root."""
+    """Non-media files under root, including optional .nfo and VobSub sidecars."""
     found = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
-            kind = junk_kind(name)
-            if not kind:
+            kind_id = junk_kind(name)
+            if not kind_id:
                 continue
+            info = JUNK_BY_ID[kind_id]
             path = os.path.join(dirpath, name)
             try:
                 size = os.path.getsize(path)
@@ -1663,10 +1862,13 @@ def find_junk_files(root: str) -> list:
                 "path": path,
                 "rel_path": os.path.relpath(path, root),
                 "name": name,
-                "kind": kind,
+                "kind": info["label"],
+                "kind_id": kind_id,
+                "detail": info["detail"],
+                "default_selected": info["default_selected"],
                 "size": size,
             })
-    found.sort(key=lambda item: item["rel_path"].lower())
+    found.sort(key=lambda item: (item["kind_id"], item["rel_path"].lower()))
     return found
 
 
@@ -1865,6 +2067,7 @@ def rematch():
     """
     Re-match a single file, either by:
       - a specific TMDB id + media_type (chosen from alternatives), or
+      - a pasted TMDB or IMDb link, or
       - a manual_title (+ optional manual_year) free-text re-search.
     Returns refreshed proposal fields including a correctly-rooted
     proposed_full_path.
@@ -1974,6 +2177,14 @@ def rematch():
                     "message": "AI could not find a different match.",
                 })
         parsed = file_parsed
+    elif (data.get("link") or "").strip():
+        if not api_key:
+            return jsonify({"error": "TMDB API key is required"}), 400
+        match, parsed, link_error = match_from_link(
+            data.get("link"), parsed, api_key, (data.get("omdb_api_key") or "").strip(),
+        )
+        if link_error:
+            return jsonify({"error": link_error}), 400
     elif not api_key:
         return jsonify({"error": "TMDB API key is required"}), 400
     elif tmdb_id and media_type:
@@ -2010,7 +2221,7 @@ def rematch():
                 match = omdb
         parsed = search_parsed
     else:
-        return jsonify({"error": "Provide a TMDB id, manual title, or AI request"}), 400
+        return jsonify({"error": "Provide a TMDB or IMDb link, a TMDB id, or a title"}), 400
 
     if not match or not match.get("matched"):
         return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
@@ -2267,19 +2478,20 @@ def orphan_folders():
 
 @app.route("/api/junk-files", methods=["POST"])
 def junk_files():
-    """Preview readmes, shortcuts and release leftovers. Nothing is deleted."""
+    """Preview leftover files grouped by type. Nothing is deleted."""
     data = request.json or {}
     root = (data.get("root_folder") or "").strip()
     if not root or not os.path.isdir(root):
         return jsonify({"error": f"Folder not found: {root}"}), 400
-    return jsonify({"files": find_junk_files(root)})
+    return jsonify({"files": find_junk_files(root), "kinds": JUNK_CATALOG})
 
 
 @app.route("/api/delete-junk", methods=["POST"])
 def delete_junk():
     """
-    Delete the given files, but only if each one still classifies as junk and
-    lives inside root. A video, subtitle, poster or .nfo is never removed.
+    Delete the given files, but only if each one still classifies as removable
+    and lives inside root. A video, text subtitle or poster is never removed.
+    .nfo and VobSub files are removed only when the user included them.
     Body: { root_folder, files: [<abs path>, ...] }
     """
     data = request.json or {}
