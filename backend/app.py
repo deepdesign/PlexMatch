@@ -228,9 +228,11 @@ def parse_filename(raw: str) -> dict:
         season, episode, marker_start, _marker_end = marker
         is_tv = True
 
-    # Everything from the episode marker onward is series-noise / episode title;
-    # the canonical episode name comes from TMDB.
-    if marker_start is not None:
+    # The show title is the text before the episode marker. Anything after it
+    # is the episode title already on the file, kept when a lookup has no name.
+    episode_title = None
+    if marker:
+        episode_title = clean_episode_title(name[marker[3]:]) or None
         name = name[:marker_start]
 
     # Extract a release year. A span such as 1985-1999 stays in the title.
@@ -266,7 +268,26 @@ def parse_filename(raw: str) -> dict:
         "episode": episode,
         "is_tv": is_tv,
         "country": country,
+        "episode_title": episode_title,
     }
+
+
+_PLACEHOLDER_EPISODE = re.compile(r"^(?:episode|ep)\s*\.?\s*#?\d{1,3}$", re.IGNORECASE)
+
+
+def useful_episode_title(name: str | None) -> str | None:
+    """A real episode title. Placeholders such as 'Episode 1' do not count."""
+    text = (name or "").strip()
+    if not text or text.upper() in {"N/A", "TBA", "TBD"}:
+        return None
+    if _PLACEHOLDER_EPISODE.match(text):
+        return None
+    return text
+
+
+def choose_episode_name(remote: str | None, local: str | None) -> str | None:
+    """Prefer the database title, and keep the filename title when that is missing."""
+    return useful_episode_title(remote) or useful_episode_title(local)
 
 
 # ---------------------------------------------------------------------------
@@ -297,14 +318,120 @@ def tmdb_search_tv(title: str, year: int | None, api_key: str) -> tuple:
     return tuple(r.json().get("results", []))
 
 
-def tmdb_episode_name(tv_id: int, season: int, episode: int, api_key: str) -> str | None:
+def tmdb_episode_record(tv_id: int, season: int, episode: int, api_key: str):
+    """Episode payload, None when that show has no such episode, False on any other failure."""
     r = requests.get(
         f"{TMDB_BASE}/tv/{tv_id}/season/{season}/episode/{episode}",
         params={"api_key": api_key},
         timeout=10,
     )
-    if r.status_code == 200:
-        return r.json().get("name")
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        return False
+    return r.json() or {}
+
+
+def tmdb_episode_name(tv_id: int, season: int, episode: int, api_key: str) -> str | None:
+    record = tmdb_episode_record(tv_id, season, episode, api_key)
+    if not record:
+        return None
+    return record.get("name")
+
+
+def related_show_title(left: str, right: str) -> bool:
+    """True when one title is the other plus extra words, as with QI and QI XL."""
+    a = re.sub(r"\s+", " ", (left or "").lower()).strip()
+    b = re.sub(r"\s+", " ", (right or "").lower()).strip()
+    if not a or not b or a == b:
+        return False
+    return a.startswith(b + " ") or b.startswith(a + " ")
+
+
+@lru_cache(maxsize=512)
+def tmdb_named_seasons(tv_id: int, api_key: str) -> tuple:
+    """(season number, season name) pairs, such as (7, 'Series L')."""
+    details = tmdb_get_details("tv", tv_id, api_key) or {}
+    rows = []
+    for season in details.get("seasons") or []:
+        number = season.get("season_number")
+        name = (season.get("name") or "").strip()
+        if number is None or not name:
+            continue
+        rows.append((int(number), name))
+    return tuple(rows)
+
+
+def _generic_season_name(name: str) -> bool:
+    """'Season 7' carries no series identity. 'Series L' does."""
+    return bool(re.match(r"^(season|series)\s*\d+$", name.strip(), re.IGNORECASE))
+
+
+def borrow_episode_title(show_id: int, show_title: str, season: int, episode: int, api_key: str) -> str | None:
+    """Episode title from a related show whose season has the same name.
+
+    Used for any series, not one title. QI XL season 7 is named Series L and
+    only lists two episodes; QI's Series L has the rest. The file stays on the
+    show it matched. Only the missing title is taken.
+    """
+    season_name = ""
+    for number, name in tmdb_named_seasons(show_id, api_key):
+        if number == season:
+            season_name = name
+            break
+    if not season_name or _generic_season_name(season_name):
+        return None
+    for item in tmdb_search_tv(show_title, None, api_key):
+        other_id = item.get("id")
+        other_name = item.get("name") or ""
+        if not other_id or other_id == show_id or not related_show_title(show_title, other_name):
+            continue
+        for number, name in tmdb_named_seasons(other_id, api_key):
+            if name.lower() != season_name.lower():
+                continue
+            record = tmdb_episode_record(other_id, number, episode, api_key)
+            if isinstance(record, dict):
+                title = useful_episode_title(record.get("name"))
+                if title:
+                    return title
+    return None
+
+
+@lru_cache(maxsize=2048)
+def tmdb_imdb_id(tv_id: int, api_key: str) -> str | None:
+    r = requests.get(
+        f"{TMDB_BASE}/tv/{tv_id}/external_ids",
+        params={"api_key": api_key},
+        timeout=10,
+    )
+    if r.status_code != 200:
+        return None
+    imdb_id = (r.json().get("imdb_id") or "").strip()
+    return imdb_id or None
+
+
+def resolve_episode_title(show_id: int, show_title: str, season: int, episode: int,
+                          api_key: str, omdb_key: str = "") -> str | None:
+    """Best episode title for any series. Stops at the first real name.
+
+    Order: this show on TMDB, a related show's season of the same name, then
+    OMDb for this show's IMDb id. A placeholder such as "Episode 2" is skipped.
+    The name already on the file is applied later, if all of these are empty.
+    """
+    record = tmdb_episode_record(show_id, season, episode, api_key)
+    if record is False:
+        return None
+    if isinstance(record, dict):
+        title = useful_episode_title(record.get("name"))
+        if title:
+            return title
+    borrowed = borrow_episode_title(show_id, show_title, season, episode, api_key)
+    if borrowed:
+        return borrowed
+    if omdb_key:
+        imdb_id = tmdb_imdb_id(show_id, api_key)
+        if imdb_id:
+            return useful_episode_title(omdb_episode_title(imdb_id, season, episode, omdb_key))
     return None
 
 
@@ -322,7 +449,7 @@ def tmdb_get_details(media_type: str, tmdb_id: int, api_key: str) -> dict | None
 
 
 def build_match_from_details(details: dict, media_type: str, parsed: dict, api_key: str,
-                             confidence: float = 1.0) -> dict:
+                             confidence: float = 1.0, omdb_key: str = "") -> dict:
     """Build a match dict from a specific TMDB record (a user-chosen title)."""
     matched_title = details.get("title") or details.get("name") or ""
     raw_date = details.get("release_date") or details.get("first_air_date") or ""
@@ -330,9 +457,9 @@ def build_match_from_details(details: dict, media_type: str, parsed: dict, api_k
     tmdb_id = details.get("id")
 
     episode_name = None
-    if media_type == "tv" and parsed.get("season") and parsed.get("episode"):
-        episode_name = tmdb_episode_name(
-            tmdb_id, parsed["season"], parsed["episode"], api_key
+    if media_type == "tv" and parsed.get("season") and parsed.get("episode") and tmdb_id:
+        episode_name = resolve_episode_title(
+            tmdb_id, matched_title, parsed["season"], parsed["episode"], api_key, omdb_key,
         )
 
     return {
@@ -383,7 +510,7 @@ def score_result(result: dict, parsed_title: str, parsed_year: int | None, is_tv
     return round(max(0.0, min(1.0, score)), 3)
 
 
-def find_best_match(parsed: dict, api_key: str) -> dict:
+def find_best_match(parsed: dict, api_key: str, omdb_key: str = "") -> dict:
     """
     Search TMDB (movies + TV). Return best match with confidence score.
     """
@@ -425,11 +552,12 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
     matched_year = raw_date[:4] if raw_date else str(year or "")
     tmdb_id = r.get("id")
 
-    # Fetch episode name if TV
+    # Every series: this show, then a related show with the same season name, then OMDb.
     episode_name = None
-    if media_type == "tv" and parsed["season"] and parsed["episode"]:
-        episode_name = tmdb_episode_name(
-            tmdb_id, parsed["season"], parsed["episode"], api_key
+    needs_review = False
+    if media_type == "tv" and parsed["season"] and parsed["episode"] and tmdb_id:
+        episode_name = resolve_episode_title(
+            tmdb_id, matched_title or title, parsed["season"], parsed["episode"], api_key, omdb_key,
         )
 
     return {
@@ -440,6 +568,7 @@ def find_best_match(parsed: dict, api_key: str) -> dict:
         "matched_title": matched_title,
         "matched_year": matched_year,
         "episode_name": episode_name,
+        "needs_review": needs_review,
         "season": parsed.get("season"),
         "episode": parsed.get("episode"),
         "tmdb_url": f"https://www.themoviedb.org/{'tv' if media_type == 'tv' else 'movie'}/{tmdb_id}",
@@ -1209,6 +1338,8 @@ def apply_layout(plex_names: dict, current_folder: str | None, restructure: bool
 
 # Folders the app creates at the library root when films and series are split.
 OUTPUT_DIR_NAMES = {MOVIES_DIR.lower(), TV_DIR.lower()}
+# Plex episode name with no title after the number: "QI XL (2009) - S18E01".
+_PLEX_EPISODE_NO_TITLE = re.compile(r"^.+ \((?:19|20)\d{2}\) - S\d{2}E\d{2}$")
 SKIP_DIR_NAMES = {
     "subs", "subtitles", "extras", "featurettes", "behind the scenes", "sample", "samples",
 }
@@ -1232,10 +1363,10 @@ def scan_directory(root: str, skip_output: bool = False) -> list:
     Walk root recursively. For each video file found, return its path and
     the best display name to parse (prefers parent folder name for single-file
     folders, falls back to filename).
-    When skip_output is set, Movies and TV directly under the library are not walked.
+    When skip_output is set, Movies and TV directly under the library are left
+    out, except episode files that have a season and episode but no title.
     """
     results = []
-    root_norm = os.path.normcase(os.path.normpath(root))
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Filter to video files only
@@ -1245,14 +1376,17 @@ def scan_directory(root: str, skip_output: bool = False) -> list:
         ]
 
         blocked = set(SKIP_DIR_NAMES)
-        at_root = os.path.normcase(os.path.normpath(dirpath)) == root_norm
-        if skip_output and at_root:
-            blocked |= OUTPUT_DIR_NAMES
-        # Skip subtitle/extras/sample folders, and the app's own Movies/TV output when asked
+        rel = os.path.relpath(dirpath, root)
+        first = "" if rel in (".", "") else Path(rel).parts[0].lower()
+        in_output = skip_output and first in OUTPUT_DIR_NAMES
+        # Skip subtitle/extras/sample folders. Movies and TV stay walkable so an
+        # episode with no title can be filled in; finished files there are ignored.
         dirnames[:] = [d for d in dirnames if d.lower() not in blocked]
 
         # Drop obvious sample clips (e.g. "...-sample.avi", "movie.sample.mkv")
         video_files = [f for f in video_files if not SAMPLE_PATTERN.search(Path(f).stem)]
+        if in_output:
+            video_files = [f for f in video_files if _PLEX_EPISODE_NO_TITLE.match(Path(f).stem)]
 
         for vf in video_files:
             full_path = os.path.join(dirpath, vf)
@@ -1572,11 +1706,13 @@ def build_proposal(f: dict, root: str, api_key: str,
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
     # A single file in a titled folder is parsed from the folder, which drops
-    # "E02" from the filename. Keep that episode number for the TV search.
-    file_marker = find_episode_marker(Path(f.get("filename") or "").stem)
-    if file_marker and parsed.get("episode") is None:
-        parsed["season"], parsed["episode"] = file_marker[0], file_marker[1]
+    # "E02" and the episode title from the filename. Keep both.
+    file_parsed = parse_filename(Path(f.get("filename") or "").stem)
+    if file_parsed.get("episode") is not None and parsed.get("episode") is None:
+        parsed["season"], parsed["episode"] = file_parsed["season"], file_parsed["episode"]
         parsed["is_tv"] = True
+    if not parsed.get("episode_title") and file_parsed.get("episode_title"):
+        parsed["episode_title"] = file_parsed["episode_title"]
     if f.get("group_tv"):
         parsed["is_tv"] = True
     if not parsed["title"]:
@@ -1594,7 +1730,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         }
 
     try:
-        match = find_best_match(parsed, api_key)
+        match = find_best_match(parsed, api_key, omdb_key)
     except Exception as e:
         return {
             **f,
@@ -1629,6 +1765,9 @@ def build_proposal(f: dict, root: str, api_key: str,
                 return cleanup
         return {**f, "parsed": parsed, **match, "status": "unmatched"}
 
+    if match.get("type") == "tv" or parsed.get("is_tv"):
+        match["episode_name"] = choose_episode_name(match.get("episode_name"), parsed.get("episode_title"))
+
     plex_names = apply_layout(
         build_plex_names(match, f["ext"], split, embed_ids),
         f.get("folder"), restructure,
@@ -1644,7 +1783,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         "proposed_filename": plex_names["filename"],
         "proposed_full_path": proposed_full_path,
         "missing_year": not match.get("matched_year"),
-        "needs_choice": needs_manual_pick(match, auto_pick),
+        "needs_choice": needs_manual_pick(match, auto_pick) or bool(match.get("needs_review")),
         "status": status,
     }
 
@@ -2150,7 +2289,7 @@ def rematch():
             )
 
         try:
-            fresh = find_best_match(file_parsed, api_key)
+            fresh = find_best_match(file_parsed, api_key, (data.get("omdb_api_key") or "").strip())
         except Exception as e:
             return jsonify({"error": str(e)}), 502
         omdb_key = (data.get("omdb_api_key") or "").strip()
@@ -2205,9 +2344,10 @@ def rematch():
             "season": parsed.get("season"),
             "episode": parsed.get("episode"),
             "is_tv": parsed.get("is_tv", False),
+            "episode_title": parsed.get("episode_title"),
         }
         try:
-            match = find_best_match(search_parsed, api_key)
+            match = find_best_match(search_parsed, api_key, (data.get("omdb_api_key") or "").strip())
         except Exception as e:
             return jsonify({"error": str(e)}), 502
         # Fall back to OMDb/IMDb if TMDB has no confident manual match
@@ -2225,6 +2365,11 @@ def rematch():
 
     if not match or not match.get("matched"):
         return jsonify({"matched": False, "confidence": 0, "status": "unmatched"})
+
+    if match.get("type") == "tv" or (parsed or {}).get("is_tv"):
+        match["episode_name"] = choose_episode_name(
+            match.get("episode_name"), (parsed or {}).get("episode_title"),
+        )
 
     plex_names = apply_layout(
         build_plex_names(match, ext, split, embed_ids),

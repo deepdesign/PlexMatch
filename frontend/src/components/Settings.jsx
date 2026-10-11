@@ -432,7 +432,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
           />
           <Toggle
             label="Skip Movies and TV subfolders"
-            sub="Leave those subfolders out of the next scan."
+            sub="Leave finished files in those subfolders out of the next scan. Episodes with no title are still checked."
             checked={settings.skip_output_folders !== false}
             onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
           />

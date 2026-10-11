@@ -478,7 +478,7 @@ export default function App() {
                   <p>Matching against TMDB...</p>
                   <p className="scan-sub">
                     {scanProgress.current} of {scanProgress.total} files processed
-                    {scanProgress.skipped?.length > 0 && ` · ${scanProgress.skipped.join(" and ")} not scanned`}
+                    {scanProgress.skipped?.length > 0 && ` · ${scanProgress.skipped.join(" and ")} left out, except episodes missing a title`}
                   </p>
                 </>
               ) : (
@@ -607,7 +607,7 @@ export default function App() {
             {scanProgress.skipped?.length > 0 && (
               <>
                 <span className="stat-dot" />
-                <span>{scanProgress.skipped.join(" and ")} not scanned</span>
+                <span>{scanProgress.skipped.join(" and ")} left out, except episodes missing a title</span>
               </>
             )}
             <span className="stat-dot" />
