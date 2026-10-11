@@ -24,6 +24,9 @@ const DEFAULT_SETTINGS = {
   split_libraries: false,
   skip_output_folders: false,
   embed_ids: false,
+  scan_movies: true,
+  scan_tv: true,
+  scan_documentaries: true,
   omdb_api_key: "",
   ai_enabled: false,
   ai_provider: "",
@@ -35,16 +38,6 @@ const DEFAULT_SETTINGS = {
 
 // Statuses the user can approve and rename
 const APPROVABLE = new Set(["pending", "cleanup"])
-
-function inPlacePath(proposal, root) {
-  const sep = (root || "").includes("\\") ? "\\" : "/"
-  const folder = proposal.folder && proposal.folder !== "."
-    ? proposal.folder.replace(/[\\/]/g, sep)
-    : ""
-  const filename = proposal.proposed_filename || proposal.filename
-  const base = (root || "").replace(/[\\/]+$/, "")
-  return folder ? `${base}${sep}${folder}${sep}${filename}` : `${base}${sep}${filename}`
-}
 
 function pathInside(file, folder) {
   const norm = (p) => p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase()
@@ -250,6 +243,9 @@ export default function App() {
           embed_ids: settings.embed_ids,
           restructure_folders: settings.restructure_folders,
           auto_pick_top: settings.auto_pick_top,
+          scan_movies: settings.scan_movies !== false,
+          scan_tv: settings.scan_tv !== false,
+          scan_documentaries: settings.scan_documentaries !== false,
           omdb_api_key: settings.omdb_api_key,
           ai_enabled: settings.ai_enabled,
           ai_provider: settings.ai_provider,
@@ -320,9 +316,7 @@ export default function App() {
       .filter(p => p.approved && APPROVABLE.has(p.status))
       .map(p => ({
         full_path: p.full_path,
-        proposed_full_path: settings?.restructure_folders
-          ? p.proposed_full_path
-          : inPlacePath(p, scanRoot),
+        proposed_full_path: p.proposed_full_path,
       }))
 
     if (!approved.length) return
@@ -506,6 +500,11 @@ export default function App() {
               split={settings.split_libraries}
               embedIds={settings.embed_ids}
               restructure={settings.restructure_folders}
+              mediaScope={{
+                scan_movies: settings.scan_movies !== false,
+                scan_tv: settings.scan_tv !== false,
+                scan_documentaries: settings.scan_documentaries !== false,
+              }}
               aiSettings={{
                 ai_enabled: settings.ai_enabled,
                 ai_provider: settings.ai_provider,
@@ -624,7 +623,7 @@ export default function App() {
             >
               {renaming
                 ? "Renaming..."
-                : `${settings?.restructure_folders ? "Rename and move" : "Rename"} ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
+                : `Rename ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
             </button>
           </div>
         </footer>

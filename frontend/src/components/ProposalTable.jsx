@@ -22,7 +22,7 @@ function ConfidencePip({ value }) {
   )
 }
 
-function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, nested, proposals = [] }) {
+function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, mediaScope, nested, proposals = [] }) {
   const [expanded, setExpanded] = useState(false)
   const [manualTitle, setManualTitle] = useState("")
   const [manualYear, setManualYear] = useState("")
@@ -30,8 +30,9 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   const [busy, setBusy] = useState(false)
   const [searchError, setSearchError] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const stayFolder = proposal.folder && proposal.folder !== "." ? proposal.folder : ""
-  const shownFolder = restructure ? proposal.proposed_folder : stayFolder
+  const shownFolder = proposal.proposed_folder && proposal.proposed_folder !== "."
+    ? proposal.proposed_folder
+    : ""
 
   const toggle = () => {
     onChange(index, { ...proposal, approved: !proposal.approved })
@@ -60,6 +61,7 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           restructure_folders: restructure,
           omdb_api_key: omdbKey,
           ...aiSettings,
+          ...mediaScope,
           matched_title: proposal.matched_title,
           confidence: proposal.confidence,
           alternatives: proposal.alternatives,
@@ -407,6 +409,35 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
   )
 }
 
+function sortValue(p, key) {
+  if (key === "approved") {
+    if (!APPROVABLE_ROW.has(p.status)) return null
+    return p.approved ? 1 : 0
+  }
+  if (key === "path") return p.rel_path || ""
+  if (key === "proposed") return p.proposed_filename || ""
+  if (key === "confidence") return typeof p.confidence === "number" ? p.confidence : -1
+  if (key === "tmdb") return p.matched_title || ""
+  return ""
+}
+
+function compareProposals(a, b, key, dir) {
+  const av = sortValue(a, key)
+  const bv = sortValue(b, key)
+  const aEmpty = av === "" || av == null
+  const bEmpty = bv === "" || bv == null
+  if (aEmpty && bEmpty) return 0
+  if (aEmpty) return 1
+  if (bEmpty) return -1
+  const sign = dir === "asc" ? 1 : -1
+  if (typeof av === "number" && typeof bv === "number") return (av - bv) * sign
+  return String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: "base" }) * sign
+}
+
+function SortMark({ active, dir }) {
+  return <span className={`sort-mark ${active ? "sort-mark--on" : ""}`} aria-hidden="true">{active ? (dir === "asc" ? "↑" : "↓") : ""}</span>
+}
+
 function needsAttention(p) {
   if (p.status === "conflict" || p.status === "unmatched" || p.status === "error") return true
   if (p.missing_year || p.needs_choice) return true
@@ -572,7 +603,7 @@ function SeasonGroup({ group, rowProps, onSetApproved }) {
   )
 }
 
-async function rematchFile(proposal, payload, { root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }) {
+async function rematchFile(proposal, payload, { root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, mediaScope }) {
   const res = await fetch(`${API}/api/rematch`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -590,6 +621,7 @@ async function rematchFile(proposal, payload, { root, apiKey, omdbKey, split, em
       restructure_folders: restructure,
       omdb_api_key: omdbKey,
       ...aiSettings,
+      ...mediaScope,
       matched_title: proposal.matched_title,
       confidence: proposal.confidence,
       alternatives: proposal.alternatives,
@@ -699,10 +731,19 @@ function SeriesBlock({ block, proposals, onChange, rowProps, onSetApproved }) {
   )
 }
 
-export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings }) {
+export default function ProposalTable({ proposals, onChange, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, mediaScope }) {
   const [filter, setFilter] = useState(() => (proposals.some(needsAttention) ? "attention" : "all"))
   const [search, setSearch] = useState("")
   const [showOrganised, setShowOrganised] = useState(false)
+  const [sort, setSort] = useState({ key: null, dir: "asc" })
+
+  const toggleSort = (key) => {
+    setSort(prev => (
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "confidence" || key === "approved" ? "desc" : "asc" }
+    ))
+  }
 
   const organisedCount = useMemo(
     () => proposals.filter(p => p.status === "organised").length,
@@ -728,16 +769,21 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
     })
   }, [proposals, filter, search, showOrganised])
 
+  const visible = useMemo(() => {
+    if (!sort.key) return filtered
+    return [...filtered].sort((a, b) => compareProposals(a, b, sort.key, sort.dir))
+  }, [filtered, sort])
+
   const updateRow = (index, updated) => {
-    // index here is into filtered, map back to original
-    const original = proposals.findIndex(p => p.full_path === filtered[index].full_path)
+    // index here is into the sorted visible list, map back to original
+    const original = proposals.findIndex(p => p.full_path === visible[index].full_path)
     const next = [...proposals]
     next[original] = updated
     onChange(next)
   }
 
   const removeRow = (index) => {
-    const target = filtered[index].full_path
+    const target = visible[index].full_path
     onChange(proposals.filter(p => p.full_path !== target))
   }
 
@@ -753,10 +799,10 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
     )))
   }
 
-  const grouped = groupSeries(groupRows(filtered))
+  const grouped = groupSeries(groupRows(visible))
   const attentionCount = proposals.filter(needsAttention).length
   const includedCount = proposals.filter(p => p.approved && APPROVABLE_ROW.has(p.status)).length
-  const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, proposals }
+  const rowProps = { onChange: updateRow, onRemove: removeRow, root, apiKey, omdbKey, split, embedIds, restructure, aiSettings, mediaScope, proposals }
   const tabs = [
     ["all", "All"],
     ["rename", `Rename (${includedCount})`],
@@ -814,12 +860,32 @@ export default function ProposalTable({ proposals, onChange, root, apiKey, omdbK
         <table className="proposal-table">
           <thead>
             <tr>
-              <th className="col-approve"></th>
-              <th className="col-original">Current path</th>
+              <th className="col-approve" aria-sort={sort.key === "approved" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="th-sort" onClick={() => toggleSort("approved")} title="Sort by included">
+                  <SortMark active={sort.key === "approved"} dir={sort.dir} />
+                </button>
+              </th>
+              <th className="col-original" aria-sort={sort.key === "path" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="th-sort" onClick={() => toggleSort("path")}>
+                  Current path <SortMark active={sort.key === "path"} dir={sort.dir} />
+                </button>
+              </th>
               <th className="col-arrow"></th>
-              <th className="col-proposed">Proposed Plex name</th>
-              <th className="col-confidence">Confidence</th>
-              <th className="col-tmdb">TMDB</th>
+              <th className="col-proposed" aria-sort={sort.key === "proposed" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="th-sort" onClick={() => toggleSort("proposed")}>
+                  Proposed Plex name <SortMark active={sort.key === "proposed"} dir={sort.dir} />
+                </button>
+              </th>
+              <th className="col-confidence" aria-sort={sort.key === "confidence" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="th-sort" onClick={() => toggleSort("confidence")}>
+                  Confidence <SortMark active={sort.key === "confidence"} dir={sort.dir} />
+                </button>
+              </th>
+              <th className="col-tmdb" aria-sort={sort.key === "tmdb" ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+                <button type="button" className="th-sort" onClick={() => toggleSort("tmdb")}>
+                  TMDB <SortMark active={sort.key === "tmdb"} dir={sort.dir} />
+                </button>
+              </th>
               <th className="col-expand"></th>
             </tr>
           </thead>

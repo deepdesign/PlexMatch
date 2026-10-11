@@ -60,6 +60,9 @@ def load_settings():
         "split_libraries": False,
         "skip_output_folders": False,
         "embed_ids": False,
+        "scan_movies": True,
+        "scan_tv": True,
+        "scan_documentaries": True,
         "omdb_api_key": "",
         "ai_enabled": False,
         "ai_provider": "",
@@ -519,27 +522,74 @@ def score_result(result: dict, parsed_title: str, parsed_year: int | None, is_tv
     return round(max(0.0, min(1.0, score)), 3)
 
 
-def find_best_match(parsed: dict, api_key: str, omdb_key: str = "") -> dict:
+# TMDB uses 99 for Documentary on both movies and TV.
+DOCUMENTARY_GENRE_ID = 99
+
+
+def media_scope(data: dict | None) -> dict:
+    """Which kinds of title this scan may suggest. Missing keys mean all of them."""
+    data = data or {}
+
+    def flag(key: str) -> bool:
+        if key not in data or data.get(key) is None:
+            return True
+        return bool(data.get(key))
+
+    movies, tv, docs = flag("scan_movies"), flag("scan_tv"), flag("scan_documentaries")
+    if not (movies or tv or docs):
+        movies = tv = docs = True
+    return {"movies": movies, "tv": tv, "documentaries": docs}
+
+
+def allowed_types(scope: dict | None, is_tv: bool) -> tuple[bool, bool, bool]:
+    """Return (search movies, search TV, prefer documentaries).
+
+    Movies never suggests a series. TV never suggests a film. Documentaries
+    may be either. With both Movies and TV selected, an episode number still
+    means a series.
+    """
+    scope = scope or {"movies": True, "tv": True, "documentaries": True}
+    movies, tv, docs = scope["movies"], scope["tv"], scope["documentaries"]
+    search_movies = movies or docs
+    search_tv = tv or docs
+    prefer_docs = bool(docs and not (movies and tv))
+    if is_tv and search_tv:
+        search_movies = False
+    if movies and not tv and not docs:
+        search_movies, search_tv = True, False
+    if tv and not movies and not docs:
+        search_movies, search_tv = False, True
+    if not search_movies and not search_tv:
+        search_movies = search_tv = True
+    return search_movies, search_tv, prefer_docs
+
+
+def _documentary_nudge(result: dict, prefer_docs: bool) -> float:
+    if not prefer_docs:
+        return 0.0
+    genres = result.get("genre_ids") or []
+    return 0.12 if DOCUMENTARY_GENRE_ID in genres else -0.08
+
+
+def find_best_match(parsed: dict, api_key: str, omdb_key: str = "", scope: dict | None = None) -> dict:
     """
     Search TMDB (movies + TV). Return best match with confidence score.
     """
     title = parsed["title"]
     year = parsed["year"]
     is_tv = parsed["is_tv"]
+    search_movies, search_tv, prefer_docs = allowed_types(scope, is_tv)
 
     candidates = []
 
-    # Episode-numbered files are a series. Do not let a movie with a similar
-    # year (Russian Roulette, 1985) outrank the show.
-    if not is_tv:
+    # Episode-numbered files are a series, unless this folder is movies only.
+    if search_movies:
         for r in tmdb_search_movie(title, year, api_key):
             candidates.append({"result": r, "type": "movie"})
 
-    for r in tmdb_search_tv(title, year, api_key):
-        candidates.append({"result": r, "type": "tv"})
-
-    if is_tv:
-        candidates = [c for c in candidates if c["type"] != "movie"]
+    if search_tv:
+        for r in tmdb_search_tv(title, year, api_key):
+            candidates.append({"result": r, "type": "tv"})
 
     if not candidates:
         return {"matched": False, "confidence": 0}
@@ -547,6 +597,7 @@ def find_best_match(parsed: dict, api_key: str, omdb_key: str = "") -> dict:
     scored = []
     for c in candidates:
         score = score_result(c["result"], title, year, is_tv, parsed.get("country"))
+        score = round(max(0.0, min(1.0, score + _documentary_nudge(c["result"], prefer_docs))), 3)
         scored.append({**c, "confidence": score})
 
     scored.sort(key=lambda x: x["confidence"], reverse=True)
@@ -768,7 +819,7 @@ def omdb_episode_title(imdb_id: str, season, episode, api_key: str) -> str | Non
     return None
 
 
-def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
+def omdb_lookup(parsed: dict, api_key: str, scope: dict | None = None) -> dict | None:
     """
     Search OMDb for `parsed`. Returns a match dict in the same shape as
     find_best_match (with imdb_id/imdb_url, source='omdb') or None.
@@ -781,8 +832,14 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
     year = parsed["year"]
     is_tv = parsed["is_tv"]
 
-    # A file with an episode number is a series. Do not fall back to a movie.
-    type_order = (["series"] if is_tv else ["movie", "series", None])
+    search_movies, search_tv, prefer_docs = allowed_types(scope, is_tv)
+    type_order = []
+    if search_movies:
+        type_order.append("movie")
+    if search_tv:
+        type_order.append("series")
+    if search_movies and search_tv and not is_tv:
+        type_order.append(None)
     data = None
     for mt in type_order:
         data = omdb_by_title(title, year, mt, api_key)
@@ -790,7 +847,10 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
             break
     if not data:
         return None
-    if is_tv and (data.get("Type") or "").lower() != "series":
+    omdb_type = (data.get("Type") or "").lower()
+    if not search_movies and omdb_type != "series":
+        return None
+    if not search_tv and omdb_type == "series":
         return None
 
     cand_title = data.get("Title") or ""
@@ -804,6 +864,9 @@ def omdb_lookup(parsed: dict, api_key: str) -> dict | None:
     elif year and not cand_year:
         year_score = 0.8
     confidence = round(title_score * 0.7 + year_score * 0.3, 3)
+    if prefer_docs:
+        genre = (data.get("Genre") or "").lower()
+        confidence = round(max(0.0, min(1.0, confidence + (0.12 if "documentary" in genre else -0.08))), 3)
     if confidence < 0.5:
         return None
 
@@ -1248,7 +1311,8 @@ def _same_rejected(match: dict | None, prior: dict | None) -> bool:
 
 
 def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, ai_cfg: dict,
-                   force: bool = False, harder: bool = False, siblings: list | None = None) -> dict | None:
+                   force: bool = False, harder: bool = False, siblings: list | None = None,
+                   scope: dict | None = None) -> dict | None:
     """
     Use AI to recover weak matches. Optionally re-query TMDB with the AI title.
     Returns a match dict or None. A harder retry will not repeat the rejected match.
@@ -1271,7 +1335,7 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
     }
 
     try:
-        tmdb_match = find_best_match(search_parsed, tmdb_api_key)
+        tmdb_match = find_best_match(search_parsed, tmdb_api_key, scope=scope)
         if tmdb_match.get("matched") and tmdb_match.get("confidence", 0) >= 0.4:
             if harder and _same_rejected(tmdb_match, prior_match):
                 return None
@@ -1297,6 +1361,11 @@ def apply_ai_match(f: dict, parsed: dict, prior_match: dict, tmdb_api_key: str, 
         "source": "ai",
         "ai_reason": inference.get("reason"),
     }
+    search_movies, search_tv, _prefer_docs = allowed_types(scope, parsed.get("is_tv"))
+    if fallback["type"] == "movie" and not search_movies:
+        return None
+    if fallback["type"] == "tv" and not search_tv:
+        return None
     if harder and _same_rejected(fallback, prior_match):
         return None
     return fallback
@@ -1372,6 +1441,40 @@ def apply_layout(plex_names: dict, current_folder: str | None, restructure: bool
         return plex_names
     folder = current_folder if current_folder and current_folder != "." else ""
     return {**plex_names, "folder": folder}
+
+
+def _retitle_folder(current_folder: str | None, new_name: str) -> str:
+    """Rename the program folder in this path. Season and disk folders stay."""
+    parts = _folder_parts(current_folder)
+    if not parts:
+        return new_name
+    for index in range(len(parts) - 1, -1, -1):
+        if not is_structural_folder(parts[index]):
+            parts[index] = new_name
+            return os.path.join(*parts)
+    return os.path.join(new_name, *parts)
+
+
+def layout_names(plex_names: dict, current_folder: str | None, restructure: bool,
+                 media_type: str | None = None, split: bool = False) -> dict:
+    """Folder and filename to propose.
+
+    With restructure off, only the filename changes. With it on, a movie's
+    folder is renamed to the film and a TV show's folder is renamed to the
+    show. Season folders stay as they are. Splitting libraries still uses the
+    Movies/ and TV/ paths.
+    """
+    if not restructure:
+        return apply_layout(plex_names, current_folder, False)
+    if split:
+        return plex_names
+    parts = _folder_parts(plex_names.get("folder"))
+    new_name = parts[0] if parts else ""
+    if not new_name:
+        return plex_names
+    if not _folder_parts(current_folder):
+        return plex_names
+    return {**plex_names, "folder": _retitle_folder(current_folder, new_name)}
 
 
 # ---------------------------------------------------------------------------
@@ -1689,9 +1792,9 @@ def build_local_cleanup(f: dict, root: str, web_lookup: bool = False,
         "episode": episode,
         "episode_name": episode_title or None,
     }
-    plex_names = apply_layout(
+    plex_names = layout_names(
         build_plex_names(match_like, f["ext"], split, embed_ids),
-        f.get("folder"), restructure,
+        f.get("folder"), restructure, media_type, split,
     )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
     status = proposal_status(proposed_full_path, f["full_path"], default="cleanup")
@@ -1769,7 +1872,7 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
     episode_name = tv.group("episode_name") if tv else None
     ids: dict = {}
 
-    if restructure:
+    if restructure and split:
         if movie:
             if len(parts) < 2:
                 return None
@@ -1777,9 +1880,7 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
             prefix = parts[:-2]
             if show_base != f"{title} ({year})":
                 return None
-            if split and prefix != (MOVIES_DIR,):
-                return None
-            if not split and prefix:
+            if prefix != (MOVIES_DIR,):
                 return None
         else:
             if len(parts) < 3:
@@ -1790,16 +1891,14 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
             prefix = parts[:-3]
             if show_base != f"{title} ({year})":
                 return None
-            if split and prefix != (TV_DIR,):
-                return None
-            if not split and prefix:
+            if prefix != (TV_DIR,):
                 return None
         if embed_ids and not tag:
             return None
         if not embed_ids and tag:
             return None
         ids = _id_fields(tag)
-    elif embed_ids:
+    elif embed_ids and not restructure:
         # Ids live on the folder. Without restructuring we can't confirm the tag
         # belongs where this scan would put it, so look the file up.
         return None
@@ -1813,12 +1912,21 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
         "episode_name": episode_name,
         **ids,
     }
-    plex = build_plex_names(match, ext, split and restructure, embed_ids and restructure)
-    if not restructure:
-        current = f.get("folder") if f.get("folder") not in (None, ".") else ""
-        plex = {**plex, "folder": current}
+    plex = layout_names(
+        build_plex_names(match, ext, split and restructure, embed_ids and restructure),
+        f.get("folder"), restructure, match["type"], split,
+    )
     proposed = os.path.join(root, plex["folder"], plex["filename"])
-    if os.path.normcase(os.path.normpath(proposed)) != os.path.normcase(os.path.normpath(f["full_path"])):
+    paths_differ = os.path.normcase(os.path.normpath(proposed)) != os.path.normcase(os.path.normpath(f["full_path"]))
+    # The file already has its Plex name. With restructure on, a movie or show
+    # folder that does not is still a rename, and it does not need another lookup.
+    folder_only = (
+        paths_differ
+        and restructure
+        and not split
+        and Path(proposed).name == Path(f["full_path"]).name
+    )
+    if paths_differ and not folder_only:
         return None
 
     return {
@@ -1845,7 +1953,8 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
         "proposed_filename": plex["filename"],
         "proposed_full_path": proposed,
         "missing_year": False,
-        "status": "organised",
+        "needs_choice": False,
+        "status": "pending" if folder_only else "organised",
         "skipped_lookup": True,
     }
 
@@ -1854,7 +1963,8 @@ def build_proposal(f: dict, root: str, api_key: str,
                    clean_unmatched: bool = False, web_lookup: bool = False,
                    split: bool = False, embed_ids: bool = False,
                    omdb_key: str = "", ai_cfg: dict | None = None,
-                   restructure: bool = True, auto_pick: bool = True) -> dict:
+                   restructure: bool = True, auto_pick: bool = True,
+                   scope: dict | None = None) -> dict:
     """Match a single scanned file against TMDB, OMDb, AI, then local cleanup."""
     organised = already_organised_proposal(f, root, split, embed_ids, restructure)
     if organised:
@@ -1897,7 +2007,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         }
 
     try:
-        match = find_best_match(parsed, api_key, omdb_key)
+        match = find_best_match(parsed, api_key, omdb_key, scope)
     except Exception as e:
         return {
             **f,
@@ -1911,7 +2021,7 @@ def build_proposal(f: dict, root: str, api_key: str,
     # TMDB missed - try OMDb/IMDb before any local/Wikipedia cleanup
     if (not match["matched"] or match["confidence"] < 0.3) and omdb_key:
         try:
-            omdb = omdb_lookup(parsed, omdb_key)
+            omdb = omdb_lookup(parsed, omdb_key, scope)
         except Exception:
             omdb = None
         if omdb and omdb["confidence"] >= 0.5:
@@ -1919,7 +2029,7 @@ def build_proposal(f: dict, root: str, api_key: str,
 
     if (not match["matched"] or match["confidence"] < 0.5) and ai_cfg.get("enabled"):
         try:
-            ai_match = apply_ai_match(f, parsed, match, api_key, ai_cfg)
+            ai_match = apply_ai_match(f, parsed, match, api_key, ai_cfg, scope=scope)
         except Exception:
             ai_match = None
         if ai_match:
@@ -1938,9 +2048,9 @@ def build_proposal(f: dict, root: str, api_key: str,
         match["folder_locked"] = True
         match["loose_name"] = file_parsed.get("title") or Path(f.get("filename") or "").stem
 
-    plex_names = apply_layout(
+    plex_names = layout_names(
         build_plex_names(match, f["ext"], split, embed_ids),
-        f.get("folder"), restructure,
+        f.get("folder"), restructure, match.get("type"), split,
     )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
     status = proposal_status(proposed_full_path, f["full_path"], default="pending")
@@ -2093,6 +2203,12 @@ _RELEASE_EXT = {".sfv", ".md5", ".sha", ".sha1", ".sha256", ".par2", ".torrent",
 
 JUNK_CATALOG = [
     {
+        "id": "sample",
+        "label": "Sample video",
+        "detail": "A short preview that came with the download, usually named sample or kept in a Sample folder. It is not the film. Uncheck a real title that happens to be called Sample.",
+        "default_selected": True,
+    },
+    {
         "id": "readme",
         "label": "Readme",
         "detail": "Notes or instructions that came with the download. Plex does not read them, so they are safe to delete.",
@@ -2132,10 +2248,26 @@ JUNK_CATALOG = [
 JUNK_BY_ID = {item["id"]: item for item in JUNK_CATALOG}
 
 
-def junk_kind(filename: str) -> str | None:
+def is_sample_video(filename: str, dirpath: str = "", root: str = "") -> bool:
+    """A preview clip, not the film. Named sample, or sitting in a Sample folder."""
+    if Path(filename).suffix.lower() not in VIDEO_EXTENSIONS:
+        return False
+    if SAMPLE_PATTERN.search(Path(filename).stem):
+        return True
+    if not dirpath or not root:
+        return False
+    rel = os.path.relpath(dirpath, root)
+    if rel in (".", ""):
+        return False
+    return any(part.lower() in {"sample", "samples"} for part in Path(rel).parts)
+
+
+def junk_kind(filename: str, dirpath: str = "", root: str = "") -> str | None:
     """Category id for a file this tool may delete, or None if it must be kept."""
     lower = filename.lower()
     suffix = Path(filename).suffix.lower()
+    if is_sample_video(filename, dirpath, root):
+        return "sample"
     if suffix in VIDEO_EXTENSIONS or suffix in KEEP_EXTENSIONS:
         return None
     if suffix in {".idx", ".sub"}:
@@ -2158,7 +2290,7 @@ def find_junk_files(root: str) -> list:
     found = []
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
-            kind_id = junk_kind(name)
+            kind_id = junk_kind(name, dirpath, root)
             if not kind_id:
                 continue
             info = JUNK_BY_ID[kind_id]
@@ -2286,12 +2418,13 @@ def scan():
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     skip_output = bool(data.get("skip_output_folders", False))
+    scope = media_scope(data)
     files = scan_directory(root, skip_output=skip_output)
     with ThreadPoolExecutor(max_workers=SCAN_CONCURRENCY) as executor:
         # executor.map preserves input order
         proposals = list(executor.map(
             lambda f: build_proposal(
-                f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick
+                f, root, api_key, clean_unmatched, web_lookup, split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick, scope
             ),
             files,
         ))
@@ -2327,6 +2460,7 @@ def scan_stream():
     omdb_key = data.get("omdb_api_key", "").strip()
     ai_cfg = parse_ai_settings(data)
     skip_output = bool(data.get("skip_output_folders", False))
+    scope = media_scope(data)
     skipped = present_output_dirs(root) if skip_output else []
     files = scan_directory(root, skip_output=skip_output)
 
@@ -2341,7 +2475,7 @@ def scan_stream():
         futures = {
             executor.submit(
                 build_proposal, f, root, api_key, clean_unmatched, web_lookup,
-                split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick,
+                split, embed_ids, omdb_key, ai_cfg, restructure, auto_pick, scope,
             ): i
             for i, f in enumerate(files)
         }
@@ -2418,6 +2552,7 @@ def rematch():
         return jsonify(cleanup)
 
     ai_cfg = parse_ai_settings(data)
+    scope = media_scope(data)
     match = None
 
     if data.get("ai"):
@@ -2459,13 +2594,13 @@ def rematch():
             )
 
         try:
-            fresh = find_best_match(file_parsed, api_key, (data.get("omdb_api_key") or "").strip())
+            fresh = find_best_match(file_parsed, api_key, (data.get("omdb_api_key") or "").strip(), scope)
         except Exception as e:
             return jsonify({"error": str(e)}), 502
         omdb_key = (data.get("omdb_api_key") or "").strip()
         if not usable(fresh) and omdb_key:
             try:
-                omdb = omdb_lookup(file_parsed, omdb_key)
+                omdb = omdb_lookup(file_parsed, omdb_key, scope)
             except Exception:
                 omdb = None
             if usable(omdb):
@@ -2476,7 +2611,7 @@ def rematch():
             try:
                 match = apply_ai_match(
                     f, file_parsed, prior_match, api_key, ai_cfg,
-                    force=True, harder=True, siblings=siblings,
+                    force=True, harder=True, siblings=siblings, scope=scope,
                 )
             except RuntimeError as e:
                 return jsonify({"error": str(e)}), 502
@@ -2518,14 +2653,14 @@ def rematch():
             "episode_title": parsed.get("episode_title"),
         }
         try:
-            match = find_best_match(search_parsed, api_key, (data.get("omdb_api_key") or "").strip())
+            match = find_best_match(search_parsed, api_key, (data.get("omdb_api_key") or "").strip(), scope)
         except Exception as e:
             return jsonify({"error": str(e)}), 502
         # Fall back to OMDb/IMDb if TMDB has no confident manual match
         omdb_key = data.get("omdb_api_key", "").strip()
         if (not match.get("matched") or match.get("confidence", 0) < 0.3) and omdb_key:
             try:
-                omdb = omdb_lookup(search_parsed, omdb_key)
+                omdb = omdb_lookup(search_parsed, omdb_key, scope)
             except Exception:
                 omdb = None
             if omdb and omdb["confidence"] >= 0.5:
@@ -2542,9 +2677,9 @@ def rematch():
             match.get("episode_name"), (parsed or {}).get("episode_title"),
         )
 
-    plex_names = apply_layout(
+    plex_names = layout_names(
         build_plex_names(match, ext, split, embed_ids),
-        data.get("folder"), restructure,
+        data.get("folder"), restructure, match.get("type"), split,
     )
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
 
@@ -2607,6 +2742,167 @@ def sidecar_paths(video_path: str) -> list:
     return found
 
 
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def _move_logged(src: str, dst: str, moves: list, results: list, sidecar: bool = False) -> None:
+    if os.path.exists(dst):
+        raise FileExistsError(f"Target already exists: {dst}")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+    moves.append({"src": src, "dst": dst})
+    if sidecar:
+        results.append({"src": src, "dst": dst, "ok": True, "sidecar": True})
+
+
+def _rename_sidecars(src: str, dst: str, moves: list, results: list) -> None:
+    new_stem = Path(dst).stem
+    dst_dir = os.path.dirname(dst)
+    for side_src, rest in sidecar_paths(src):
+        side_dst = os.path.join(dst_dir, new_stem + rest)
+        try:
+            _move_logged(side_src, side_dst, moves, results, sidecar=True)
+        except Exception as e:
+            results.append({"src": side_src, "dst": side_dst, "ok": False, "error": str(e), "sidecar": True})
+
+
+def _one_folder_change(src: str, dst: str, root: str) -> tuple[str, str] | None:
+    """If dst only renames one folder above src, return that old and new folder."""
+    if not root:
+        return None
+    try:
+        src_rel = os.path.relpath(os.path.dirname(src), root)
+        dst_rel = os.path.relpath(os.path.dirname(dst), root)
+    except ValueError:
+        return None
+    src_parts = _folder_parts(src_rel)
+    dst_parts = _folder_parts(dst_rel)
+    if len(src_parts) != len(dst_parts) or not src_parts:
+        return None
+    diffs = [
+        i for i, (a, b) in enumerate(zip(src_parts, dst_parts))
+        if os.path.normcase(a) != os.path.normcase(b)
+    ]
+    if len(diffs) != 1:
+        return None
+    index = diffs[0]
+    old_dir = os.path.join(root, *src_parts[: index + 1])
+    new_dir = os.path.join(root, *dst_parts[: index + 1])
+    if _same_path(old_dir, new_dir) or _same_path(old_dir, root):
+        return None
+    return old_dir, new_dir
+
+
+def perform_renames(approved: list, root: str = "") -> tuple[list, list]:
+    """Move approved files. A movie or show folder is renamed so other files stay inside it.
+
+    File renames inside that folder are logged first, then the folder rename, so
+    undo puts the folder back before it restores the old filename.
+    """
+    results = []
+    moves = []
+    buckets = defaultdict(list)
+    solo = []
+    for item in approved:
+        change = _one_folder_change(item["full_path"], item["proposed_full_path"], root)
+        if not change:
+            solo.append(item)
+            continue
+        buckets[_same_key(change[0])].append((item, change))
+
+    handled = set()
+    for rows in buckets.values():
+        new_dirs = {change[1] for _item, change in rows}
+        items = [item for item, _change in rows]
+        if len(new_dirs) != 1:
+            solo.extend(items)
+            continue
+        old_dir, dst_dir = rows[0][1]
+        for item in items:
+            handled.add(_same_key(item["full_path"]))
+        if os.path.exists(dst_dir):
+            for item in items:
+                results.append({
+                    "src": item["full_path"],
+                    "dst": item["proposed_full_path"],
+                    "ok": False,
+                    "error": f"Target already exists: {dst_dir}",
+                })
+            continue
+        failed = False
+        for item in items:
+            src = item["full_path"]
+            final = item["proposed_full_path"]
+            rel_under = os.path.relpath(src, old_dir)
+            sub = os.path.dirname(rel_under)
+            in_place = os.path.join(old_dir, sub, os.path.basename(final)) if sub not in ("", ".") else os.path.join(old_dir, os.path.basename(final))
+            try:
+                if not _same_path(src, in_place):
+                    companions = sidecar_paths(src)
+                    _move_logged(src, in_place, moves, results)
+                    new_stem = Path(in_place).stem
+                    for side_src, rest in companions:
+                        side_dst = os.path.join(os.path.dirname(in_place), new_stem + rest)
+                        try:
+                            _move_logged(side_src, side_dst, moves, results, sidecar=True)
+                        except Exception as e:
+                            results.append({
+                                "src": side_src, "dst": side_dst, "ok": False,
+                                "error": str(e), "sidecar": True,
+                            })
+            except Exception as e:
+                failed = True
+                results.append({"src": src, "dst": final, "ok": False, "error": str(e)})
+        if failed:
+            continue
+        try:
+            os.rename(old_dir, dst_dir)
+            moves.append({"src": old_dir, "dst": dst_dir})
+            for item in items:
+                results.append({"src": item["full_path"], "dst": item["proposed_full_path"], "ok": True})
+        except Exception as e:
+            for item in items:
+                results.append({
+                    "src": item["full_path"],
+                    "dst": item["proposed_full_path"],
+                    "ok": False,
+                    "error": str(e),
+                })
+
+    for item in solo:
+        if _same_key(item["full_path"]) in handled:
+            continue
+        src = item["full_path"]
+        dst = item["proposed_full_path"]
+        try:
+            if _same_path(src, dst):
+                results.append({"src": src, "dst": dst, "ok": True})
+                continue
+            companions = sidecar_paths(src)
+            _move_logged(src, dst, moves, results)
+            results.append({"src": src, "dst": dst, "ok": True})
+            new_stem = Path(dst).stem
+            dst_dir = os.path.dirname(dst)
+            for side_src, rest in companions:
+                side_dst = os.path.join(dst_dir, new_stem + rest)
+                try:
+                    _move_logged(side_src, side_dst, moves, results, sidecar=True)
+                except Exception as e:
+                    results.append({
+                        "src": side_src, "dst": side_dst, "ok": False,
+                        "error": str(e), "sidecar": True,
+                    })
+        except Exception as e:
+            results.append({"src": src, "dst": dst, "ok": False, "error": str(e)})
+
+    return results, moves
+
+
+def _same_key(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
 @app.route("/api/rename", methods=["POST"])
 def rename():
     """
@@ -2618,38 +2914,7 @@ def rename():
     approved = data.get("approved", [])  # list of proposal objects
     clean_empty = bool(data.get("clean_empty_folders", False))
 
-    results = []
-    moves = []
-
-    for item in approved:
-        src = item["full_path"]
-        dst = item["proposed_full_path"]
-
-        try:
-            if os.path.abspath(src) == os.path.abspath(dst):
-                results.append({"src": src, "dst": dst, "ok": True})
-                continue
-            if os.path.exists(dst):
-                raise FileExistsError(f"Target already exists: {dst}")
-            companions = sidecar_paths(src)
-            dst_dir = os.path.dirname(dst)
-            os.makedirs(dst_dir, exist_ok=True)
-            shutil.move(src, dst)
-            results.append({"src": src, "dst": dst, "ok": True})
-            moves.append({"src": src, "dst": dst})
-            new_stem = Path(dst).stem
-            for side_src, rest in companions:
-                side_dst = os.path.join(dst_dir, new_stem + rest)
-                try:
-                    if os.path.exists(side_dst):
-                        raise FileExistsError(f"Target already exists: {side_dst}")
-                    shutil.move(side_src, side_dst)
-                    results.append({"src": side_src, "dst": side_dst, "ok": True, "sidecar": True})
-                    moves.append({"src": side_src, "dst": side_dst})
-                except Exception as e:
-                    results.append({"src": side_src, "dst": side_dst, "ok": False, "error": str(e), "sidecar": True})
-        except Exception as e:
-            results.append({"src": src, "dst": dst, "ok": False, "error": str(e)})
+    results, moves = perform_renames(approved, root)
 
     removed_folders = []
     if clean_empty and root and os.path.isdir(root):
@@ -2806,7 +3071,8 @@ def junk_files():
 def delete_junk():
     """
     Delete the given files, but only if each one still classifies as removable
-    and lives inside root. A video, text subtitle or poster is never removed.
+    and lives inside root. A film, text subtitle or poster is never removed.
+    Sample videos are removed only when the user included them.
     .nfo and VobSub files are removed only when the user included them.
     Body: { root_folder, files: [<abs path>, ...] }
     """
@@ -2826,7 +3092,7 @@ def delete_junk():
                 raise ValueError("File is outside the library root")
             if not os.path.isfile(target):
                 raise FileNotFoundError("File no longer exists")
-            if not junk_kind(os.path.basename(target)):
+            if not junk_kind(os.path.basename(target), os.path.dirname(target), root_abs):
                 raise ValueError("File is not junk - skipped")
             os.remove(target)
             results.append({"path": fpath, "ok": True})

@@ -130,6 +130,17 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
     onChange({ ...settings, [key]: value })
   }
 
+  const setMediaType = (key, checked) => {
+    const next = {
+      scan_movies: settings.scan_movies !== false,
+      scan_tv: settings.scan_tv !== false,
+      scan_documentaries: settings.scan_documentaries !== false,
+      [key]: checked,
+    }
+    if (!next.scan_movies && !next.scan_tv && !next.scan_documentaries) return
+    onChange({ ...settings, ...next })
+  }
+
   const toggleAi = () => {
     const enabled = !settings.ai_enabled
     onChange({
@@ -251,7 +262,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
     settings.web_lookup ? "Wikipedia" : null,
   ].filter(Boolean).join(" · ")
   const outputSummary = [
-    settings.restructure_folders ? "Plex folders" : "Rename in place",
+    settings.restructure_folders ? "Folder names" : "Rename in place",
     settings.embed_ids && settings.restructure_folders ? "IDs" : null,
   ].filter(Boolean).join(" · ")
   const docsSummary = [
@@ -331,6 +342,25 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
           {folderValid === null && !pickError && (
             <span className="field-hint">Type a path, or click Browse to pick a folder</span>
           )}
+          <div className="media-types">
+            <span className="field-label">This folder contains</span>
+            <div className="media-type-row">
+              {[
+                ["scan_movies", "Movies"],
+                ["scan_tv", "TV series"],
+                ["scan_documentaries", "Documentaries"],
+              ].map(([key, label]) => (
+                <label key={key} className="media-type">
+                  <input
+                    type="checkbox"
+                    checked={settings[key] !== false}
+                    onChange={e => setMediaType(key, e.target.checked)}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
 
         <Accordion
@@ -393,8 +423,8 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
           summary={<span className="setup-summary">{outputSummary}</span>}
         >
           <Toggle
-            label="Restructure into Plex folders"
-            sub={<>Move files into <code>Title (Year)/</code> subfolders. Off keeps each file in its current folder and only renames it.</>}
+            label="Change folder names"
+            sub="Renames a movie's folder to be the same as the film it contains, and a TV show's folder to the show name."
             checked={settings.restructure_folders}
             onClick={() => update("restructure_folders", !settings.restructure_folders)}
           />
@@ -402,7 +432,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             label="Add TMDB/IMDb IDs to folder names"
             sub={settings.restructure_folders
               ? <>Append <code>{"{tmdb-…}"}</code> so Plex matches exactly (recommended for obscure titles)</>
-              : "Only applies when files move into Plex folders."}
+              : "Only applies when folder names are changed."}
             checked={settings.embed_ids}
             disabled={!settings.restructure_folders}
             onClick={() => update("embed_ids", !settings.embed_ids)}
@@ -425,7 +455,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             label="Separate into movies and TV subfolders"
             sub={settings.restructure_folders
               ? <>One-off documentaries go in <code>Movies/</code>. Documentary series go in <code>TV/</code>.</>
-              : "Only applies when files move into Plex folders."}
+              : "Only applies when folder names are changed."}
             checked={settings.split_libraries}
             disabled={!settings.restructure_folders}
             onClick={() => update("split_libraries", !settings.split_libraries)}

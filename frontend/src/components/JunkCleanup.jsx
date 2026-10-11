@@ -129,7 +129,7 @@ export default function JunkCleanup({ root, onClose }) {
         </div>
 
         <p className="modal-sub">
-          Checked files will be deleted. Text subtitles (<code>.srt</code>) and posters are never listed.
+          Checked files will be deleted. Sample videos are included. Text subtitles (<code>.srt</code>) and posters are never listed.
         </p>
 
         {error && <div className="modal-error">{error}</div>}
