@@ -15,6 +15,7 @@ function loadOpenGroups(hasKey) {
         return {
           matching: saved.matching !== false,
           output: !!saved.output,
+          documentaries: !!saved.documentaries,
           keys: !!saved.keys,
           tools: !!saved.tools,
         }
@@ -23,7 +24,7 @@ function loadOpenGroups(hasKey) {
   } catch {
     // A bad cache falls through to the first-run defaults.
   }
-  return { matching: true, output: false, keys: !hasKey, tools: false }
+  return { matching: true, output: false, documentaries: false, keys: !hasKey, tools: false }
 }
 
 const AI_PROVIDERS = {
@@ -251,9 +252,11 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
   ].filter(Boolean).join(" · ")
   const outputSummary = [
     settings.restructure_folders ? "Plex folders" : "Rename in place",
-    settings.split_libraries && settings.restructure_folders ? "Docs into Movies/TV" : null,
-    settings.skip_output_folders !== false ? "Skip docs in Movies/TV" : null,
     settings.embed_ids && settings.restructure_folders ? "IDs" : null,
+  ].filter(Boolean).join(" · ")
+  const docsSummary = [
+    settings.split_libraries ? "Movies and TV subfolders" : "Don't separate",
+    settings.skip_output_folders !== false ? "Skip Movies/TV" : null,
   ].filter(Boolean).join(" · ")
 
   const keyBadges = (
@@ -396,21 +399,6 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             onClick={() => update("restructure_folders", !settings.restructure_folders)}
           />
           <Toggle
-            label="Separate Documentaries into movies and TV subfolders"
-            sub={settings.restructure_folders
-              ? <>One-off documentaries go in <code>Movies/</code>. Documentary series go in <code>TV/</code>.</>
-              : "Only applies when files move into Plex folders."}
-            checked={settings.split_libraries}
-            disabled={!settings.restructure_folders}
-            onClick={() => update("split_libraries", !settings.split_libraries)}
-          />
-          <Toggle
-            label="Skip Documentaries already in movies and TV subfolders"
-            sub="Leave those subfolders out of the next scan."
-            checked={settings.skip_output_folders !== false}
-            onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
-          />
-          <Toggle
             label="Add TMDB/IMDb IDs to folder names"
             sub={settings.restructure_folders
               ? <>Append <code>{"{tmdb-…}"}</code> so Plex matches exactly (recommended for obscure titles)</>
@@ -424,6 +412,29 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             sub="Remove source folders left empty after files move out"
             checked={settings.clean_empty_folders}
             onClick={() => update("clean_empty_folders", !settings.clean_empty_folders)}
+          />
+        </Accordion>
+
+        <Accordion
+          title="Documentaries"
+          open={openGroups.documentaries}
+          onToggle={() => toggleGroup("documentaries")}
+          summary={<span className="setup-summary">{docsSummary}</span>}
+        >
+          <Toggle
+            label="Separate into movies and TV subfolders"
+            sub={settings.restructure_folders
+              ? <>One-off documentaries go in <code>Movies/</code>. Documentary series go in <code>TV/</code>.</>
+              : "Only applies when files move into Plex folders."}
+            checked={settings.split_libraries}
+            disabled={!settings.restructure_folders}
+            onClick={() => update("split_libraries", !settings.split_libraries)}
+          />
+          <Toggle
+            label="Skip Movies and TV subfolders"
+            sub="Leave those subfolders out of the next scan."
+            checked={settings.skip_output_folders !== false}
+            onClick={() => update("skip_output_folders", !(settings.skip_output_folders !== false))}
           />
         </Accordion>
 
