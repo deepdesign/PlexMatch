@@ -177,6 +177,97 @@ def strip_scene_group(text: str) -> str:
     return text
 
 
+# A download-site watermark. The same address shows up in any arrangement:
+# "www UIndex org - Title", "Title - www.UIndex.org", "Title.www.YTS.MX.1080p".
+_WWW_WORD = re.compile(r"(?<![A-Za-z0-9])www(?![A-Za-z0-9])", re.IGNORECASE)
+_SITE_LABEL = re.compile(r"[\s._-]+([A-Za-z0-9]{1,31})")
+_SITE_DASH = re.compile(r"\s*[-–—]\s*")
+_SITE_TLDS = {
+    "com", "org", "net", "info", "biz", "pw", "to", "mx", "me", "tv", "cc",
+    "eu", "ru", "ws", "la", "gs", "am", "ag", "io", "co", "xyz", "site",
+    "club", "ch", "de", "nl", "se", "nu", "sx", "st", "gy", "sh", "vc",
+    "li", "be", "pl", "uk", "us", "in", "tk", "ml", "ga", "cf", "gq",
+    "ph", "re", "nz", "pro", "mobi", "name", "online", "app", "live",
+    "news", "wiki", "bz", "su", "cx", "im", "gg", "ms", "ly", "gl",
+}
+_SITE_NOISE = {
+    "4k", "2160p", "1080p", "1080i", "720p", "480p", "576p",
+    "bluray", "bdrip", "webrip", "webdl", "hdtv", "dvdrip",
+    "x264", "x265", "h264", "h265", "hevc", "xvid",
+}
+
+
+def _indexer_site_span(text: str):
+    """Start and end of one www-site watermark, or None.
+
+    Labels may be separated by spaces, dots, underscores, or hyphens. The
+    address ends at a known ending such as org or mx, at a short ending after
+    a site name, or at a dash before the real title.
+    """
+    www = _WWW_WORD.search(text)
+    if not www:
+        return None
+    start = www.start()
+    pos = www.end()
+    labels = []
+    accepted = None
+    while len(labels) < 5:
+        label = _SITE_LABEL.match(text, pos)
+        if not label:
+            break
+        word = label.group(1)
+        low = word.lower()
+        if re.fullmatch(r"(?:19|20)\d{2}", word) or low in _SITE_NOISE:
+            break
+        labels.append(word)
+        pos = label.end()
+        if low in _SITE_TLDS:
+            accepted = pos
+            break
+        # " - Title" is the film, not another piece of the address.
+        if re.match(r"\s+[-–—]\s+", text[pos:]):
+            break
+    ate_dash = False
+    if accepted is None:
+        if not labels:
+            return None
+        dash = _SITE_DASH.match(text, pos)
+        if not dash:
+            return None
+        end = dash.end()
+        ate_dash = True
+    else:
+        end = accepted
+    if start > 0 and end < len(text) and text[start - 1] in "([{" and text[end] in ")]}":
+        start -= 1
+        end += 1
+    if not ate_dash:
+        before = re.search(r"[-–—]\s*$", text[:start])
+        if before:
+            start = before.start()
+        after = _SITE_DASH.match(text, end)
+        if after:
+            end = after.end()
+    if not text[:start].strip() and not text[end:].strip():
+        return None
+    return start, end
+
+
+def strip_indexer_prefix(text: str) -> str:
+    """Drop a download-site watermark wherever it sits in a file or folder name."""
+    cleaned = text
+    for _ in range(3):
+        span = _indexer_site_span(cleaned)
+        if not span:
+            break
+        nxt = f"{cleaned[:span[0]]} {cleaned[span[1]:]}"
+        nxt = re.sub(r"\s+", " ", nxt).strip()
+        if not re.sub(r"[\s._\-–—]+", "", nxt):
+            break
+        cleaned = nxt
+    return cleaned
+
+
 def find_episode_marker(name: str):
     """Return (season, episode, start, end) for the first episode marker, else None."""
     m = SXXEXX_PATTERN.search(name)
@@ -225,9 +316,11 @@ def parse_filename(raw: str) -> dict:
     Extract title, year, season, episode from a raw filename/folder name.
     Returns a dict with keys: title, year, season, episode, is_tv
     """
-    name = raw
+    name = raw.strip()
     # Strip file extension if present
     name = re.sub(r"\.[a-z0-9]{2,4}$", "", name, flags=re.IGNORECASE)
+    # A download site pasted onto the name is not part of the film.
+    name = strip_indexer_prefix(name)
     # Drop bracketed scene tags (e.g. "[rartv]") so they can't leak into titles
     name = BRACKET_TAG_PATTERN.sub(" ", name)
 
@@ -1477,6 +1570,46 @@ def layout_names(plex_names: dict, current_folder: str | None, restructure: bool
     return {**plex_names, "folder": _retitle_folder(current_folder, new_name)}
 
 
+def relayout_proposal(proposal: dict, root: str, restructure: bool, split: bool, embed_ids: bool) -> dict:
+    """Rewrite a proposal's path from the match it already has.
+
+    Folder names, id tags, and movie/TV subfolders change the destination
+    only. The title match stays as it was.
+    """
+    title = proposal.get("matched_title") or ""
+    full_path = proposal.get("full_path") or ""
+    if not title or not full_path or not proposal.get("proposed_filename"):
+        return proposal
+    ext = proposal.get("ext") or Path(proposal.get("filename") or "").suffix
+    match = {
+        "matched_title": title,
+        "matched_year": proposal.get("matched_year") or "",
+        "type": proposal.get("type") or "movie",
+        "season": proposal.get("season"),
+        "episode": proposal.get("episode"),
+        "episode_name": proposal.get("episode_name"),
+        "tmdb_id": proposal.get("tmdb_id"),
+        "imdb_id": proposal.get("imdb_id"),
+        "folder_locked": proposal.get("folder_locked"),
+        "loose_name": proposal.get("loose_name"),
+    }
+    plex = layout_names(
+        build_plex_names(match, ext, split, embed_ids),
+        proposal.get("folder"), restructure, match["type"], split,
+    )
+    folder = plex.get("folder") or ""
+    proposed = os.path.join(root, folder, plex["filename"]) if folder else os.path.join(root, plex["filename"])
+    default = "cleanup" if proposal.get("local_cleanup") or proposal.get("status") == "cleanup" else "pending"
+    updated = {
+        **proposal,
+        "proposed_folder": plex["folder"],
+        "proposed_filename": plex["filename"],
+        "proposed_full_path": proposed,
+        "status": proposal_status(proposed, full_path, default=default),
+    }
+    return annotate_clash(updated, root)
+
+
 # ---------------------------------------------------------------------------
 # File scanning
 # ---------------------------------------------------------------------------
@@ -1586,6 +1719,482 @@ def proposal_status(proposed_full_path: str, current_full_path: str, default: st
     if os.path.exists(proposed_full_path):
         return "conflict"
     return default
+
+
+def _ebml_header(buf: bytes, pos: int):
+    """Read an EBML id and size. Size is None when the element length is unknown."""
+    if pos >= len(buf) or buf[pos] == 0:
+        return None
+
+    def vint_len(first):
+        mask = 0x80
+        length = 1
+        while length < 8 and not (first & mask):
+            mask >>= 1
+            length += 1
+        return length, mask
+
+    id_len, _mask = vint_len(buf[pos])
+    if pos + id_len > len(buf):
+        return None
+    eid = int.from_bytes(buf[pos:pos + id_len], "big")
+    size_at = pos + id_len
+    if size_at >= len(buf):
+        return None
+    size_len, mask = vint_len(buf[size_at])
+    if size_at + size_len > len(buf):
+        return None
+    raw = buf[size_at:size_at + size_len]
+    data_at = size_at + size_len
+    if all(b == 0xFF for b in raw):
+        return eid, None, data_at
+    value = raw[0] & (mask - 1)
+    for b in raw[1:]:
+        value = (value << 8) | b
+    return eid, value, data_at
+
+
+def _ebml_children(buf: bytes):
+    pos = 0
+    while pos + 2 <= len(buf):
+        header = _ebml_header(buf, pos)
+        if not header:
+            break
+        eid, size, data_at = header
+        if size is None or data_at + size > len(buf):
+            break
+        yield eid, buf[data_at:data_at + size]
+        pos = data_at + size
+
+
+def _mkv_video_size(payload: bytes):
+    """Pixel width and height from a Matroska Tracks element."""
+    best = None
+    for eid, body in _ebml_children(payload):
+        if eid != 0xAE:  # TrackEntry
+            continue
+        track_type = None
+        video = None
+        for cid, cbody in _ebml_children(body):
+            if cid == 0x83 and cbody:  # TrackType, 1 = video
+                track_type = int.from_bytes(cbody, "big")
+            elif cid == 0xE0:  # Video
+                video = cbody
+        if track_type != 1 or not video:
+            continue
+        width = height = None
+        for vid, vbody in _ebml_children(video):
+            if vid == 0xB0:  # PixelWidth
+                width = int.from_bytes(vbody, "big")
+            elif vid == 0xBA:  # PixelHeight
+                height = int.from_bytes(vbody, "big")
+        if width and height and (best is None or width * height > best[0] * best[1]):
+            best = (width, height)
+    return best
+
+
+def _mkv_dimensions(path: str):
+    """Frame size stored in a Matroska or WebM file."""
+    with open(path, "rb") as handle:
+        magic = handle.read(4)
+        if magic != b"\x1a\x45\xdf\xa3":
+            return None
+        handle.seek(0, os.SEEK_END)
+        file_size = handle.tell()
+        handle.seek(0)
+        header = handle.read(min(file_size, 4096))
+        parsed = _ebml_header(header, 0)
+        if not parsed or parsed[0] != 0x1A45DFA3 or parsed[1] is None:
+            return None
+        pos = parsed[2] + parsed[1]
+        if pos + 12 > file_size:
+            return None
+        handle.seek(pos)
+        seg_hdr = handle.read(16)
+        segment = _ebml_header(seg_hdr, 0)
+        if not segment or segment[0] != 0x18538067:
+            return None
+        seg_data = pos + segment[2]
+        cursor = seg_data
+        tracks_at = None
+        seen = 0
+        while cursor + 12 <= file_size and seen < 64:
+            seen += 1
+            handle.seek(cursor)
+            hdr = handle.read(16)
+            element = _ebml_header(hdr, 0)
+            if not element:
+                break
+            eid, size, data_at = element
+            data_pos = cursor + data_at
+            if eid == 0x1654AE6B and size:  # Tracks
+                tracks_at = cursor
+                break
+            if eid == 0x114D9B74 and size and size <= 1024 * 1024:  # SeekHead
+                handle.seek(data_pos)
+                for sid, sbody in _ebml_children(handle.read(size)):
+                    if sid != 0x4DBB:  # Seek
+                        continue
+                    seek_id = seek_pos = None
+                    for cid, cbody in _ebml_children(sbody):
+                        if cid == 0x53AB:
+                            seek_id = cbody
+                        elif cid == 0x53AC:
+                            seek_pos = int.from_bytes(cbody, "big") if cbody else None
+                    if seek_id == b"\x16\x54\xae\x6b" and seek_pos is not None:
+                        tracks_at = seg_data + seek_pos
+            if eid == 0x1F43B675:  # Cluster: tracks are indexed before the picture data
+                break
+            if not size:
+                break
+            cursor = data_pos + size
+        if tracks_at is None:
+            return None
+        handle.seek(tracks_at)
+        entry = _ebml_header(handle.read(16), 0)
+        if not entry or entry[0] != 0x1654AE6B or not entry[1]:
+            return None
+        if entry[1] > 8 * 1024 * 1024:
+            return None
+        handle.seek(tracks_at + entry[2])
+        return _mkv_video_size(handle.read(entry[1]))
+
+
+def _mp4_boxes(data: bytes, start: int, end: int):
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                break
+            size = int.from_bytes(data[pos + 8:pos + 16], "big")
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            break
+        yield kind, pos + header, pos + size
+        pos += size
+
+
+def _mp4_dimensions(path: str):
+    """Encoded frame size from an MP4, M4V, or MOV file."""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        file_size = handle.tell()
+        pos = 0
+        moov_at = moov_size = None
+        while pos + 8 <= file_size:
+            handle.seek(pos)
+            hdr = handle.read(16)
+            if len(hdr) < 8:
+                break
+            size = int.from_bytes(hdr[0:4], "big")
+            kind = hdr[4:8]
+            header = 8
+            if size == 1:
+                if len(hdr) < 16:
+                    break
+                size = int.from_bytes(hdr[8:16], "big")
+                header = 16
+            elif size == 0:
+                size = file_size - pos
+            if size < header:
+                break
+            if kind == b"moov":
+                moov_at, moov_size = pos, size
+                break
+            pos += size
+        if moov_at is None:
+            return None
+        handle.seek(moov_at)
+        data = handle.read(min(moov_size, 32 * 1024 * 1024))
+    found = []
+
+    def walk(start, end):
+        for kind, body, stop in _mp4_boxes(data, start, end):
+            if kind in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                walk(body, stop)
+            elif kind == b"tkhd" and stop - body >= 84:
+                version = data[body]
+                off = 76 if version == 0 else 88
+                if body + off + 8 <= stop:
+                    width = int.from_bytes(data[body + off:body + off + 4], "big") >> 16
+                    height = int.from_bytes(data[body + off + 4:body + off + 8], "big") >> 16
+                    if width and height:
+                        found.append((width, height, False))
+            elif kind == b"stsd" and stop - body >= 16:
+                count = int.from_bytes(data[body + 4:body + 8], "big")
+                cursor = body + 8
+                for _n in range(min(count, 8)):
+                    if cursor + 36 > stop:
+                        break
+                    entry = int.from_bytes(data[cursor:cursor + 4], "big")
+                    if entry < 36 or cursor + entry > stop:
+                        break
+                    width = int.from_bytes(data[cursor + 32:cursor + 34], "big")
+                    height = int.from_bytes(data[cursor + 34:cursor + 36], "big")
+                    if 0 < width < 20000 and 0 < height < 20000:
+                        found.append((width, height, True))
+                    cursor += entry
+
+    walk(0, len(data))
+    coded = [item for item in found if item[2]]
+    pool = coded or found
+    if not pool:
+        return None
+    width, height, _coded = max(pool, key=lambda item: item[0] * item[1])
+    return width, height
+
+
+def _avi_dimensions(path: str):
+    """Frame size from the first video stream header in an AVI file."""
+    with open(path, "rb") as handle:
+        data = handle.read(2 * 1024 * 1024)
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"AVI ":
+        return None
+    pos = 0
+    while True:
+        pos = data.find(b"strh", pos)
+        if pos < 0 or pos + 16 > len(data):
+            return None
+        size = int.from_bytes(data[pos + 4:pos + 8], "little")
+        if data[pos + 8:pos + 12] == b"vids":
+            stream = data.find(b"strf", pos + 8 + size)
+            if 0 <= stream <= pos + size + 64 and stream + 20 <= len(data):
+                width = int.from_bytes(data[stream + 12:stream + 16], "little", signed=True)
+                height = abs(int.from_bytes(data[stream + 16:stream + 20], "little", signed=True))
+                if width > 0 and height > 0:
+                    return width, height
+        pos += 4
+
+
+def _windows_frame_size(path: str):
+    """Frame width and height from the Windows file properties."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import HRESULT, POINTER, Structure, byref, c_ubyte, c_ulong, c_ushort, c_void_p, c_wchar_p
+    except Exception:
+        return None
+
+    class GUID(Structure):
+        _fields_ = [
+            ("Data1", c_ulong),
+            ("Data2", c_ushort),
+            ("Data3", c_ushort),
+            ("Data4", c_ubyte * 8),
+        ]
+
+    class PROPERTYKEY(Structure):
+        _fields_ = [("fmtid", GUID), ("pid", c_ulong)]
+
+    class PROPVARIANT(Structure):
+        _fields_ = [
+            ("vt", c_ushort),
+            ("r1", c_ushort),
+            ("r2", c_ushort),
+            ("r3", c_ushort),
+            ("blob", c_ubyte * 16),
+        ]
+
+    ole32 = ctypes.windll.ole32
+    shell32 = ctypes.windll.shell32
+    ole32.CoInitializeEx.argtypes = [c_void_p, c_ulong]
+    ole32.CoInitializeEx.restype = HRESULT
+    ole32.CoUninitialize.argtypes = []
+    ole32.PropVariantClear.argtypes = [POINTER(PROPVARIANT)]
+    ole32.PropVariantClear.restype = HRESULT
+    shell32.SHGetPropertyStoreFromParsingName.argtypes = [
+        c_wchar_p, c_void_p, c_ulong, POINTER(GUID), POINTER(c_void_p),
+    ]
+    shell32.SHGetPropertyStoreFromParsingName.restype = HRESULT
+
+    iid = GUID(0x886D8EEB, 0x8CF2, 0x4446, (c_ubyte * 8)(0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
+    video = GUID(0x64440491, 0x4C8B, 0x11D1, (c_ubyte * 8)(0x8B, 0x70, 0x08, 0x00, 0x36, 0xB1, 0x1A, 0x03))
+    started = ole32.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+    if started not in (0, 1) and (started & 0xFFFFFFFF) != 0x80010106:
+        return None
+    store = c_void_p()
+    try:
+        if shell32.SHGetPropertyStoreFromParsingName(os.path.abspath(path), None, 0, byref(iid), byref(store)) != 0 or not store:
+            return None
+        table = ctypes.cast(store, POINTER(POINTER(c_void_p)))[0]
+        get_value = ctypes.WINFUNCTYPE(HRESULT, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT))(table[5])
+        release = ctypes.WINFUNCTYPE(c_ulong, c_void_p)(table[2])
+
+        def read(pid):
+            key = PROPERTYKEY(video, pid)
+            var = PROPVARIANT()
+            if get_value(store, byref(key), byref(var)) != 0:
+                return None
+            try:
+                if var.vt == 19:  # VT_UI4
+                    return int.from_bytes(bytes(var.blob[:4]), "little")
+                if var.vt == 3:  # VT_I4
+                    return int.from_bytes(bytes(var.blob[:4]), "little", signed=True)
+                return None
+            finally:
+                ole32.PropVariantClear(byref(var))
+
+        width, height = read(3), read(4)  # System.Video.FrameWidth / FrameHeight
+        release(store)
+        store = c_void_p()
+        if width and height and 0 < width < 20000 and 0 < height < 20000:
+            return int(width), int(height)
+        return None
+    except Exception:
+        return None
+    finally:
+        if store:
+            try:
+                table = ctypes.cast(store, POINTER(POINTER(c_void_p)))[0]
+                ctypes.WINFUNCTYPE(c_ulong, c_void_p)(table[2])(store)
+            except Exception:
+                pass
+        if started in (0, 1):
+            ole32.CoUninitialize()
+
+
+def media_dimensions(path: str):
+    """Frame width and height from the file, not from its name.
+
+    Matroska, MP4, and AVI are read directly. Other types use the Windows
+    file properties (Frame width and Frame height).
+    """
+    ext = Path(path).suffix.lower()
+    try:
+        if ext in {".mkv", ".webm"}:
+            dims = _mkv_dimensions(path)
+        elif ext in {".mp4", ".m4v", ".mov"}:
+            dims = _mp4_dimensions(path)
+        elif ext == ".avi":
+            dims = _avi_dimensions(path)
+        else:
+            dims = None
+    except OSError:
+        dims = None
+    if dims:
+        return dims
+    try:
+        return _windows_frame_size(path)
+    except Exception:
+        return None
+
+
+_RES_TOKEN = re.compile(r"\b(2160p|1080p|1080i|720p|576p|480p|4k)\b", re.IGNORECASE)
+_SOURCE_TOKEN = re.compile(
+    r"\b(bluray|blu-ray|bdrip|webrip|web-dl|webdl|hdtv|dvdrip)\b", re.IGNORECASE,
+)
+_CODEC_TOKEN = re.compile(r"\b(x265|x264|h\.?265|h\.?264|hevc|av1)\b", re.IGNORECASE)
+_AUDIO_TOKEN = re.compile(
+    r"\b(dts-hd|truehd|atmos|dts|aac|ac3|eac3|dd5\.1|ddp5\.1|flac)\b", re.IGNORECASE,
+)
+
+
+def video_facts(path: str, root: str) -> dict:
+    """Size, frame size, and filename hints for choosing between two copies."""
+    name = os.path.basename(path)
+    stem = Path(name).stem
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    try:
+        modified = os.path.getmtime(path)
+    except OSError:
+        modified = None
+    dims = None
+    try:
+        dims = media_dimensions(path)
+    except Exception:
+        dims = None
+    if dims:
+        width, height = dims
+        label = f"{width}×{height}"
+    else:
+        width = height = 0
+        resolution = _RES_TOKEN.search(stem)
+        label = None
+        if resolution:
+            label = resolution.group(1).lower()
+            if label == "4k":
+                label = "2160p"
+    source = _SOURCE_TOKEN.search(stem)
+    codec = _CODEC_TOKEN.search(stem)
+    audio = _AUDIO_TOKEN.search(stem)
+    return {
+        "path": path,
+        "rel_path": os.path.relpath(path, root),
+        "name": name,
+        "size": size,
+        "modified": modified,
+        "width": width,
+        "height": height,
+        "resolution": label,
+        "source": source.group(1) if source else None,
+        "codec": codec.group(1) if codec else None,
+        "audio": audio.group(1) if audio else None,
+    }
+
+
+def folder_clash(root: str, proposal: dict) -> dict | None:
+    """A movie whose new folder already contains another copy of a film.
+
+    TV show folders are meant to hold many episodes, so they are not a clash.
+    """
+    if (proposal.get("type") or "") != "movie":
+        return None
+    proposed = proposal.get("proposed_full_path") or ""
+    current = proposal.get("full_path") or ""
+    if not proposed or not current or not root:
+        return None
+    dest_dir = os.path.dirname(proposed)
+    if not dest_dir or not os.path.isdir(dest_dir):
+        return None
+    if _same_path(dest_dir, os.path.dirname(current)) or _same_path(dest_dir, root):
+        return None
+    existing = []
+    try:
+        names = os.listdir(dest_dir)
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(dest_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if Path(name).suffix.lower() not in VIDEO_EXTENSIONS:
+            continue
+        if SAMPLE_PATTERN.search(Path(name).stem):
+            continue
+        if _same_path(path, current):
+            continue
+        existing.append(video_facts(path, root))
+    if not existing:
+        return None
+    return {
+        "folder": os.path.relpath(dest_dir, root),
+        "incoming": video_facts(current, root),
+        "existing": existing,
+    }
+
+
+def annotate_clash(proposal: dict, root: str) -> dict:
+    """Attach a folder comparison, and hold the rename until the user picks one."""
+    if not proposal or not proposal.get("proposed_full_path"):
+        return proposal
+    clash = folder_clash(root, proposal)
+    if not clash:
+        if "clash" in proposal:
+            proposal = {k: v for k, v in proposal.items() if k != "clash"}
+        return proposal
+    status = proposal.get("status")
+    if status in ("pending", "cleanup"):
+        status = "conflict"
+    return {**proposal, "clash": clash, "status": status}
 
 
 def _norm_title(title: str | None) -> str:
@@ -1865,7 +2474,10 @@ def already_organised_proposal(f: dict, root: str, split: bool, embed_ids: bool,
     if not movie and not tv:
         return None
 
-    title = (movie or tv).group("title")
+    title = (movie or tv).group("title").strip()
+    # A finished Plex name does not still carry a download-site watermark.
+    if _indexer_site_span(title):
+        return None
     year = (movie or tv).group("year")
     season = int(tv.group("season")) if tv else None
     episode = int(tv.group("episode")) if tv else None
@@ -1968,7 +2580,7 @@ def build_proposal(f: dict, root: str, api_key: str,
     """Match a single scanned file against TMDB, OMDb, AI, then local cleanup."""
     organised = already_organised_proposal(f, root, split, embed_ids, restructure)
     if organised:
-        return organised
+        return annotate_clash(organised, root)
     ai_cfg = ai_cfg or {"enabled": False}
     do_cleanup = clean_unmatched or web_lookup
     parsed = parse_filename(f["parse_hint"])
@@ -1996,7 +2608,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         if do_cleanup:
             cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids, restructure)
             if cleanup:
-                return cleanup
+                return annotate_clash(cleanup, root)
         return {
             **f,
             "parsed": parsed,
@@ -2039,7 +2651,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         if do_cleanup:
             cleanup = build_local_cleanup(f, root, web_lookup, split, embed_ids, restructure)
             if cleanup:
-                return cleanup
+                return annotate_clash(cleanup, root)
         return {**f, "parsed": parsed, **match, "status": "unmatched"}
 
     if match.get("type") == "tv" or parsed.get("is_tv"):
@@ -2055,7 +2667,7 @@ def build_proposal(f: dict, root: str, api_key: str,
     proposed_full_path = os.path.join(root, plex_names["folder"], plex_names["filename"])
     status = proposal_status(proposed_full_path, f["full_path"], default="pending")
 
-    return {
+    return annotate_clash({
         **f,
         "parsed": parsed,
         **match,
@@ -2065,7 +2677,7 @@ def build_proposal(f: dict, root: str, api_key: str,
         "missing_year": not match.get("matched_year"),
         "needs_choice": needs_manual_pick(match, auto_pick) or bool(match.get("needs_review")),
         "status": status,
-    }
+    }, root)
 
 
 # ---------------------------------------------------------------------------
@@ -2127,12 +2739,16 @@ def _subtree_has_video(dirpath: str) -> bool:
     return False
 
 
+def _is_top_level(path: str, root_abs: str) -> bool:
+    parent = os.path.dirname(os.path.normpath(path))
+    return os.path.normcase(parent) == os.path.normcase(os.path.normpath(root_abs))
+
+
 def find_orphan_folders(root: str) -> list:
     """
-    Find the top-most folders under root whose entire subtree contains no video
-    files (e.g. leftover release folders holding only .txt/.nfo/.jpg). A folder
-    is reported only if its parent DOES still contain video (or is root), so a
-    junk folder rolls up to a single deletable entry instead of every subfolder.
+    Top-level folders under the library whose entire subtree contains no video
+    files. A Subs folder of .srt files inside a movie is not offered, because
+    that movie folder still has a video.
     """
     root_abs = os.path.abspath(root)
 
@@ -2146,11 +2762,7 @@ def find_orphan_folders(root: str) -> list:
 
     orphans = []
     for dirpath in has_video:
-        if dirpath == root_abs or has_video[dirpath]:
-            continue
-        parent = os.path.dirname(dirpath)
-        # Report only the top-most empty folder (parent still has video, or is root)
-        if parent != root_abs and not has_video.get(parent, True):
+        if has_video[dirpath] or not _is_top_level(dirpath, root_abs):
             continue
 
         # Summarise what's inside so the user knows what they're deleting
@@ -2176,8 +2788,8 @@ def find_orphan_folders(root: str) -> list:
 
 
 # Files a release folder often ships that Plex never uses.
-# Text subtitles and posters are never offered. .nfo and VobSub (.idx + .sub)
-# are listed so the user can choose, but they start unchecked.
+# Text subtitles are never offered. Pictures from the download are offered and
+# start checked. .nfo and VobSub (.idx + .sub) are listed but start unchecked.
 JUNK_EXTENSIONS = {
     ".txt", ".text", ".md", ".markdown", ".rtf", ".html", ".htm",
     ".url", ".lnk", ".webloc", ".website",
@@ -2192,10 +2804,12 @@ JUNK_NAMES = {
     "thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store",
     "readme", "read.me",
 }
-# Never deletable from this tool: text subs and artwork stay with the video.
+# Never deletable from this tool: text subtitles stay with the video.
 KEEP_EXTENSIONS = {
     ".srt", ".ass", ".ssa", ".sup", ".vtt",
-    ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+}
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tbn",
 }
 _README_EXT = {".txt", ".text", ".md", ".markdown", ".rtf", ".diz", ".html", ".htm", ".pdf", ".doc", ".docx"}
 _LINK_EXT = {".url", ".lnk", ".webloc", ".website"}
@@ -2206,6 +2820,12 @@ JUNK_CATALOG = [
         "id": "sample",
         "label": "Sample video",
         "detail": "A short preview that came with the download, usually named sample or kept in a Sample folder. It is not the film. Uncheck a real title that happens to be called Sample.",
+        "default_selected": True,
+    },
+    {
+        "id": "image",
+        "label": "Picture",
+        "detail": "A picture that came with the download, such as www.YTS.MX.jpg. It is not the film's artwork. Uncheck a real poster if you want to keep one.",
         "default_selected": True,
     },
     {
@@ -2268,6 +2888,8 @@ def junk_kind(filename: str, dirpath: str = "", root: str = "") -> str | None:
     suffix = Path(filename).suffix.lower()
     if is_sample_video(filename, dirpath, root):
         return "sample"
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
     if suffix in VIDEO_EXTENSIONS or suffix in KEEP_EXTENSIONS:
         return None
     if suffix in {".idx", ".sub"}:
@@ -2505,6 +3127,24 @@ def scan_stream():
     )
 
 
+@app.route("/api/relayout", methods=["POST"])
+def relayout():
+    """Apply folder-name options to proposals from the scan already on screen."""
+    data = request.json or {}
+    root = data.get("root_folder") or ""
+    restructure = bool(data.get("restructure_folders", False))
+    split = bool(data.get("split_libraries", False))
+    embed_ids = bool(data.get("embed_ids", False))
+    proposals = data.get("proposals") or []
+    if not root or not os.path.isdir(root):
+        return jsonify({"error": "Library folder not found"}), 400
+    updated = [
+        relayout_proposal(p, root, restructure, split, embed_ids)
+        for p in proposals if isinstance(p, dict)
+    ]
+    return jsonify({"proposals": updated})
+
+
 @app.route("/api/rematch", methods=["POST"])
 def rematch():
     """
@@ -2693,15 +3333,18 @@ def rematch():
     else:
         status = "pending"
 
-    return jsonify({
+    refreshed = annotate_clash({
         **match,
+        "full_path": full_path,
+        "type": match.get("type"),
         "parsed": parsed,
         "proposed_folder": plex_names["folder"],
         "proposed_filename": plex_names["filename"],
         "proposed_full_path": proposed_full_path,
         "missing_year": not match.get("matched_year"),
         "status": status,
-    })
+    }, root)
+    return jsonify(refreshed)
 
 
 # Same-folder companions that belong with a video (subs, artwork, nfo).
@@ -2903,6 +3546,64 @@ def _same_key(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
 
+def _inside_root(root: str, path: str) -> bool:
+    if not root or not path:
+        return False
+    root_abs = os.path.abspath(root)
+    target = os.path.abspath(path)
+    if os.path.normcase(target) == os.path.normcase(root_abs):
+        return False
+    try:
+        return os.path.normcase(os.path.commonpath([root_abs, target])) == os.path.normcase(root_abs)
+    except ValueError:
+        return False
+
+
+def apply_folder_clashes(actions: list, root: str, moves: list, results: list) -> None:
+    """Keep one copy when a movie would land in a folder that already has one.
+
+    The copy that is not kept is deleted. Deletes are not written to the undo log.
+    """
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        keep = action.get("keep") or ""
+        incoming = action.get("full_path") or ""
+        proposed = action.get("proposed_full_path") or ""
+        existing = [p for p in (action.get("existing") or []) if isinstance(p, str)]
+        if not incoming or not proposed or not keep or not all(_inside_root(root, p) for p in (keep, incoming, proposed, *existing)):
+            results.append({"src": incoming, "dst": proposed, "ok": False, "error": "Choose a file inside the library"})
+            continue
+        try:
+            if _same_path(keep, incoming):
+                for path in existing:
+                    if os.path.isfile(path) and not _same_path(path, incoming):
+                        os.remove(path)
+                        results.append({"src": path, "dst": path, "ok": True, "deleted": True})
+                if not os.path.isfile(incoming):
+                    raise FileNotFoundError("File no longer exists")
+                companions = sidecar_paths(incoming)
+                _move_logged(incoming, proposed, moves, results)
+                results.append({"src": incoming, "dst": proposed, "ok": True})
+                new_stem = Path(proposed).stem
+                dst_dir = os.path.dirname(proposed)
+                for side_src, rest in companions:
+                    side_dst = os.path.join(dst_dir, new_stem + rest)
+                    try:
+                        _move_logged(side_src, side_dst, moves, results, sidecar=True)
+                    except Exception as e:
+                        results.append({"src": side_src, "dst": side_dst, "ok": False, "error": str(e), "sidecar": True})
+            elif any(_same_path(keep, path) for path in existing):
+                if not os.path.isfile(incoming):
+                    raise FileNotFoundError("File no longer exists")
+                os.remove(incoming)
+                results.append({"src": incoming, "dst": keep, "ok": True, "deleted": True})
+            else:
+                raise ValueError("Choose one of the copies shown")
+        except Exception as e:
+            results.append({"src": incoming, "dst": proposed, "ok": False, "error": str(e)})
+
+
 @app.route("/api/rename", methods=["POST"])
 def rename():
     """
@@ -2914,7 +3615,12 @@ def rename():
     approved = data.get("approved", [])  # list of proposal objects
     clean_empty = bool(data.get("clean_empty_folders", False))
 
-    results, moves = perform_renames(approved, root)
+    results = []
+    moves = []
+    apply_folder_clashes(data.get("clashes") or [], root, moves, results)
+    more_results, more_moves = perform_renames(approved, root)
+    results.extend(more_results)
+    moves.extend(more_moves)
 
     removed_folders = []
     if clean_empty and root and os.path.isdir(root):
@@ -3071,8 +3777,8 @@ def junk_files():
 def delete_junk():
     """
     Delete the given files, but only if each one still classifies as removable
-    and lives inside root. A film, text subtitle or poster is never removed.
-    Sample videos are removed only when the user included them.
+    and lives inside root. A film or text subtitle is never removed.
+    Sample videos and pictures are removed only when the user included them.
     .nfo and VobSub files are removed only when the user included them.
     Body: { root_folder, files: [<abs path>, ...] }
     """
@@ -3127,6 +3833,8 @@ def delete_folders():
                 raise ValueError("Folder is outside the library root")
             if not os.path.isdir(target):
                 raise FileNotFoundError("Folder no longer exists")
+            if not _is_top_level(target, root_abs):
+                raise ValueError("Only a folder directly inside the library can be removed")
             if _subtree_has_video(target):
                 raise ValueError("Folder now contains a video file - skipped")
 

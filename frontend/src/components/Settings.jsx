@@ -102,7 +102,7 @@ function Accordion({ title, open, onToggle, summary, children }) {
   )
 }
 
-export default function Settings({ settings, onChange, onScan, onStop, scanning }) {
+export default function Settings({ settings, onChange, onScan, onStop, scanning, resultsCurrent }) {
   const [folderValid, setFolderValid] = useState(null)
   const [validating, setValidating] = useState(false)
   const [localFolder, setLocalFolder] = useState(settings.root_folder || "")
@@ -513,7 +513,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
                   type="button"
                   className="btn-secondary btn-cleanup"
                   onClick={() => setCleaningJunk(true)}
-                  title="Choose readmes, release files, NFO and picture subtitles to delete"
+                  title="Choose readmes, release pictures, NFO and picture subtitles to delete"
                 >
                   <svg viewBox="0 0 16 16" fill="none">
                     <path d="M4 2.5h5l3 3V13.5H4v-11z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
@@ -521,7 +521,7 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
                   </svg>
                   Clean up junk files
                 </button>
-                <span className="toggle-sub">Readmes and release files start selected. NFO and picture subtitles stay unless you include them.</span>
+                <span className="toggle-sub">Readmes, release files and pictures start selected. NFO and picture subtitles stay unless you include them.</span>
               </div>
             </div>
           ) : (
@@ -534,7 +534,8 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
         <button
           className="btn-primary btn-scan"
           onClick={() => (scanning ? onStop() : onScan(settings.root_folder))}
-          disabled={!scanning && !canScan}
+          disabled={!scanning && (!canScan || resultsCurrent)}
+          title={resultsCurrent ? "Change the folder or how files are matched to scan again" : undefined}
         >
           {scanning ? (
             <>
@@ -553,6 +554,9 @@ export default function Settings({ settings, onChange, onScan, onStop, scanning 
             </>
           )}
         </button>
+        {resultsCurrent && (
+          <p className="settings-warn">Change the folder or how files are matched to scan again</p>
+        )}
         {!settings.tmdb_api_key ? (
           <button type="button" className="settings-warn" onClick={() => setOpenGroups(groups => ({ ...groups, keys: true }))}>
             Add a TMDB API key to scan

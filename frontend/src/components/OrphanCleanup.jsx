@@ -74,8 +74,8 @@ export default function OrphanCleanup({ root, onClose }) {
         </div>
 
         <p className="modal-sub">
-          Folders under your library that contain <strong>no video files</strong> -
-          typically leftovers holding only <code>.txt</code>, <code>.nfo</code> or images.
+          Folders directly inside your library that contain no video files anywhere,
+          including in subfolders. A subtitle folder inside a movie is left alone.
           Deleting a folder removes everything inside it permanently.
         </p>
 

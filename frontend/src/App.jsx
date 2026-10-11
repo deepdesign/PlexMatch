@@ -39,6 +39,39 @@ const DEFAULT_SETTINGS = {
 // Statuses the user can approve and rename
 const APPROVABLE = new Set(["pending", "cleanup"])
 
+// Options that change what a scan matches. Folder names, id tags, movie/TV
+// subfolders, and cleanup apply to the results already on screen.
+function scanSignature(settings) {
+  if (!settings) return ""
+  return JSON.stringify({
+    root_folder: settings.root_folder || "",
+    tmdb_api_key: settings.tmdb_api_key || "",
+    omdb_api_key: settings.omdb_api_key || "",
+    openai_api_key: settings.openai_api_key || "",
+    anthropic_api_key: settings.anthropic_api_key || "",
+    openai_base_url: settings.openai_base_url || "",
+    ai_provider: settings.ai_provider || "",
+    ai_model: settings.ai_model || "",
+    auto_pick_top: !!settings.auto_pick_top,
+    ai_enabled: !!settings.ai_enabled,
+    web_lookup: !!settings.web_lookup,
+    clean_unmatched: !!settings.clean_unmatched,
+    skip_output_folders: !!settings.skip_output_folders,
+    scan_movies: settings.scan_movies !== false,
+    scan_tv: settings.scan_tv !== false,
+    scan_documentaries: settings.scan_documentaries !== false,
+  })
+}
+
+function layoutStamp(settings) {
+  if (!settings) return ""
+  return [
+    settings.restructure_folders ? "1" : "0",
+    settings.split_libraries ? "1" : "0",
+    settings.embed_ids ? "1" : "0",
+  ].join("")
+}
+
 function pathInside(file, folder) {
   const norm = (p) => p.replace(/[\\/]+/g, "/").replace(/\/$/, "").toLowerCase()
   const target = norm(file)
@@ -139,6 +172,12 @@ export default function App() {
   const [renameResults, setRenameResults] = useState([])
   const [error, setError] = useState(null)
   const [scanRoot, setScanRoot] = useState("")
+  const [scannedSignature, setScannedSignature] = useState("")
+  const scannedLayout = useRef(null)
+  const proposalsRef = useRef([])
+  const scanRootRef = useRef("")
+  proposalsRef.current = proposals
+  scanRootRef.current = scanRoot
   const [lastBatch, setLastBatch] = useState(null)
   const [undoing, setUndoing] = useState(false)
   const [resultNote, setResultNote] = useState(null)
@@ -226,6 +265,8 @@ export default function App() {
     setStage(1)
 
     const root = rootOverride || settings.root_folder
+    setScannedSignature(scanSignature(settings))
+    scannedLayout.current = layoutStamp(settings)
     let received = 0
 
     try {
@@ -312,14 +353,22 @@ export default function App() {
   }, [settings])
 
   const handleRename = useCallback(async () => {
+    const clashes = proposals
+      .filter(p => p.clash && p.clashKeep)
+      .map(p => ({
+        keep: p.clashKeep,
+        full_path: p.full_path,
+        proposed_full_path: p.proposed_full_path,
+        existing: (p.clash.existing || []).map(file => file.path),
+      }))
     const approved = proposals
-      .filter(p => p.approved && APPROVABLE.has(p.status))
+      .filter(p => p.approved && APPROVABLE.has(p.status) && !p.clash)
       .map(p => ({
         full_path: p.full_path,
         proposed_full_path: p.proposed_full_path,
       }))
 
-    if (!approved.length) return
+    if (!approved.length && !clashes.length) return
     setRenaming(true)
     setResultNote(null)
 
@@ -330,6 +379,7 @@ export default function App() {
         body: JSON.stringify({
           root_folder: scanRoot,
           approved,
+          clashes,
           clean_empty_folders: settings.clean_empty_folders,
         }),
       })
@@ -371,7 +421,54 @@ export default function App() {
     }
   }, [lastBatch])
 
-  const approvedCount = proposals.filter(p => p.approved && APPROVABLE.has(p.status)).length
+  const layoutKey = layoutStamp(settings)
+  useEffect(() => {
+    if (!settings || scanning) return
+    if (scannedLayout.current == null || scannedLayout.current === layoutKey) return
+    const root = scanRootRef.current
+    const current = proposalsRef.current
+    if (!root || !current.length) {
+      scannedLayout.current = layoutKey
+      return
+    }
+    const stamp = layoutKey
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${API}/api/relayout`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            root_folder: root,
+            restructure_folders: !!settings.restructure_folders,
+            split_libraries: !!settings.split_libraries,
+            embed_ids: !!settings.embed_ids,
+            proposals: current,
+          }),
+        })
+        const data = await res.json()
+        if (cancelled || !res.ok || !Array.isArray(data.proposals)) return
+        const previous = new Map(current.map(p => [p.full_path, p]))
+        setProposals(data.proposals.map(p => {
+          const old = previous.get(p.full_path)
+          if (!old) return { ...p, approved: APPROVABLE.has(p.status) && !p.needs_choice, selectedAlt: null }
+          if (p.proposed_full_path === old.proposed_full_path && p.status === old.status) return old
+          const wasApprovable = APPROVABLE.has(old.status)
+          const nowApprovable = APPROVABLE.has(p.status)
+          let approved = old.approved
+          if (!nowApprovable) approved = false
+          else if (!wasApprovable) approved = !p.needs_choice
+          return { ...p, approved, selectedAlt: old.selectedAlt ?? null }
+        }))
+        scannedLayout.current = stamp
+      } catch {
+        // A later change of these switches retries.
+      }
+    })()
+    return () => { cancelled = true }
+  }, [layoutKey, scanning, settings])
+
+  const approvedCount = proposals.filter(p => (p.clash && p.clashKeep) || (p.approved && APPROVABLE.has(p.status) && !p.clash)).length
   const matchedCount = proposals.filter(p => p.matched).length
   const cleanupCount = proposals.filter(p => p.status === "cleanup").length
   const unmatchedCount = proposals.filter(p => !p.matched && p.status !== "cleanup").length
@@ -380,6 +477,9 @@ export default function App() {
   const plexLibraries = settings && lastBatch && settings.split_libraries && settings.restructure_folders
     ? plexLibraryPaths(scanRoot, renameResults)
     : []
+  const signature = scanSignature(settings)
+  const resultsCurrent = stage === 2 && !scanning && scannedSignature !== "" && signature === scannedSignature
+  const resultsStale = stage === 2 && !scanning && scannedSignature !== "" && signature !== scannedSignature
 
   if (!settings) {
     return (
@@ -428,6 +528,7 @@ export default function App() {
             onScan={handleScan}
             onStop={stopScan}
             scanning={scanning}
+            resultsCurrent={resultsCurrent}
           />
         </aside>
 
@@ -619,11 +720,14 @@ export default function App() {
             <button
               className="btn-primary"
               onClick={handleRename}
-              disabled={renaming || approvedCount === 0}
+              disabled={renaming || resultsStale || approvedCount === 0}
+              title={resultsStale ? "These results were matched with different options. Scan again first." : undefined}
             >
               {renaming
                 ? "Renaming..."
-                : `Rename ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
+                : resultsStale
+                  ? "Scan again to rename"
+                  : `Rename ${approvedCount} file${approvedCount !== 1 ? "s" : ""}`}
             </button>
           </div>
         </footer>

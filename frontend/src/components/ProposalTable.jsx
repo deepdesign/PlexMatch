@@ -9,6 +9,88 @@ const CONFIDENCE_LABEL = (c) => {
   return { label: "None", cls: "conf-none" }
 }
 
+const RES_PIXELS = {
+  "2160p": 3840 * 2160,
+  "1080p": 1920 * 1080,
+  "1080i": 1920 * 1080,
+  "720p": 1280 * 720,
+  "576p": 720 * 576,
+  "480p": 720 * 480,
+}
+
+function resolutionRank(file) {
+  if (file.width > 0 && file.height > 0) return file.width * file.height
+  return RES_PIXELS[file.resolution] ?? -1
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "Size unknown"
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+function formatWhen(stamp) {
+  if (!stamp) return null
+  const date = new Date(stamp * 1000)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+}
+
+function ClashCompare({ clash, chosen, onChoose }) {
+  const copies = [
+    { role: "This download", file: clash.incoming },
+    ...clash.existing.map(file => ({ role: "Already in the folder", file })),
+  ]
+  const sizes = copies.map(c => c.file.size || 0)
+  const largest = Math.max(...sizes)
+  const ranks = copies.map(c => resolutionRank(c.file))
+  const bestRank = Math.max(...ranks)
+  return (
+    <tr className="clash-row">
+      <td colSpan={7}>
+        <details className="clash-acc" open>
+          <summary>Choose which copy to keep in {clash.folder}</summary>
+          <div className="clash-cards">
+            {copies.map(({ role, file }) => {
+              const selected = chosen === file.path
+              const hints = []
+              if (largest > 0 && file.size === largest && sizes.filter(s => s === largest).length === 1) hints.push("Largest")
+              if (bestRank >= 0 && resolutionRank(file) === bestRank && ranks.filter(r => r === bestRank).length === 1) hints.push("Highest resolution")
+              const facts = [
+                formatBytes(file.size),
+                file.resolution || "Resolution unknown",
+                file.source,
+                file.codec,
+                file.audio,
+                formatWhen(file.modified),
+              ].filter(Boolean)
+              return (
+                <div key={file.path} className={`clash-card${selected ? " selected" : ""}`}>
+                  <div className="clash-role">{role}</div>
+                  <div className="clash-name" title={file.rel_path}>{file.name}</div>
+                  <div className="clash-facts">
+                    {facts.map(fact => <span key={fact} className="clash-chip">{fact}</span>)}
+                    {hints.map(hint => <span key={hint} className="clash-chip mark">{hint}</span>)}
+                  </div>
+                  <button
+                    type="button"
+                    className={selected ? "btn-primary" : "btn-secondary"}
+                    onClick={() => onChoose(selected ? null : file.path)}
+                  >
+                    {selected ? "Keeping this copy" : "Keep this copy"}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+          <p className="clash-note">The copy you don't keep is deleted when you rename. That delete can't be undone.</p>
+        </details>
+      </td>
+    </tr>
+  )
+}
+
 function ConfidencePip({ value }) {
   const { label, cls } = CONFIDENCE_LABEL(value)
   const pct = Math.round(value * 100)
@@ -226,7 +308,11 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
           ) : (
             <div className="proposed-names">
               {isOrganised && <span className="organised-label">Already organised</span>}
-              {isConflict && <span className="conflict-label">Target already exists - duplicate or wrong match</span>}
+              {isConflict && (
+                <span className="conflict-label">
+                  {proposal.clash ? "This folder already has a copy" : "Target already exists - duplicate or wrong match"}
+                </span>
+              )}
               {isAiSource && proposal.ai_reason && (
                 <span className="ai-reason-label" title={proposal.ai_reason}>AI: {proposal.ai_reason}</span>
               )}
@@ -291,11 +377,19 @@ function ProposalRow({ proposal, index, onChange, onRemove, root, apiKey, omdbKe
         </td>
       </tr>
 
+      {proposal.clash && (
+        <ClashCompare
+          clash={proposal.clash}
+          chosen={proposal.clashKeep}
+          onChoose={path => onChange(index, { ...proposal, clashKeep: path })}
+        />
+      )}
+
       {expanded && (
         <tr className="alt-row">
           <td colSpan={7}>
             <div className="alt-panel">
-              {isConflict && (
+              {isConflict && !proposal.clash && (
                 <div className="conflict-resolve">
                   <span className="alt-heading">A file already exists at the target</span>
                   <p className="conflict-help">
